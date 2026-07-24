@@ -279,6 +279,8 @@ All coordination commands leverage the same K-run rendering system:
 | `/coordinate` | 1 + N workers + optional fix-up | Subtask count + fix-up pass | Manifest size, one fix-up |
 | `/council` | K + K + 1 (CHAIRMAN) | Panelist count (double-spawn: answer + rank) + chairman | K panelists, single pass |
 | `/redteam` | 1 + up to 2N | Build + N attack/patch cycles | `--rounds` (1-8) |
+| `/gauntlet` | 10+ (whole pipeline) | All stages: council/gate/decompose/build/verify/harden/integrate | `--skip-council` · `--skip-redteam` · cast sheet confirm |
+| `/chain` | Varies by stage count | Selected stages only | Stage count, prerequisite validation |
 
 All costs are additive on top of the existing three commands. Rounds/clamp caps keep them bounded.
 
@@ -477,6 +479,51 @@ Two actions at the bottom:
 ```
 /opinion --cast-defaults Should we use Redis or Postgres?
 ```
+
+### `/gauntlet <prompt> [--skip-council] [--skip-redteam] [--deliberate=council|debate] [--resume [dir]]` — full campaign pipeline
+
+The gauntlet is the composite command: seven stages running the harness's complete lifecycle in fixed order over one shared artifacts dir (`/tmp/gauntlet-*`).
+
+**Fixed stage order:**
+
+1. **DELIBERATE** — council investigates the request (panel answers, Borda ranking, chairman synthesis) → saves `plan.md`. `--skip-council` writes the prompt verbatim as `plan.md`. `--deliberate=debate` runs a debate (openings + anonymized judge verdict) instead.
+2. **GATE-FIRST** — VALIDATOR designs `gate.py` from the prompt + plan digest; baseline must fail RED.
+3. **DECOMPOSE** — COORDINATOR reads the prompt, writes `subtasks.json` with path-partitioned write domains.
+4. **BUILD** — workers execute dependency levels from the manifest.
+5. **VERIFY** — gate correction loop (builder + gate → escalation → gate repair → re-run) until green or halt.
+6. **HARDEN** — attacker sortie loop until CONCEDE or cap. `--skip-redteam` jumps straight to INTEGRATE.
+7. **INTEGRATE** — COORDINATOR resumes, writes final report against the original prompt.
+
+**Flags:**
+
+| Flag | Effect |
+|---|---|
+| `--skip-council` | Write prompt verbatim as `plan.md` — skips the council panel entirely |
+| `--skip-redteam` | Skip HARDEN — campaign goes from VERIFY-green to INTEGRATE |
+| `--deliberate=debate` | Replace council with a debate (rounds + judge verdict as `plan.md`) |
+| `--resume [dir]` | Resume a halted campaign from `state.json`; default dir = latest `gauntlet-*` in `/tmp` |
+
+**Cost**: this is the most expensive command (10+ spawns). Use `--skip-council` / `--skip-redteam` to bound it. The cast sheet doubles as the pre-spend confirmation gate.
+
+**Board**: a live widget shows stage progress (k/N · name · elapsed · cumulative cost), per-stage status glyphs, and the subtask checklist from `subtasks.json` once the DECOMPOSE stage completes. A final board panel summarizes the whole run.
+
+**Resume**: every stage writes its outcome to `state.json`. `/gauntlet --resume` (optionally with a dir path) re-enters at the first incomplete stage with the stored prompt and cast — completed stages' artifacts are reused.
+
+### `/chain <stages> <prompt>` — run ordered stage subsets
+
+`/chain` composes any ordered subset of named stages:
+
+```
+/chain gate,build,verify <prompt>                                # gate-first → build → verify over one dir
+/chain deliberate,gate,decompose,build <prompt>                   # up to BUILD, no verify/integrate
+/chain verify,integrate <prompt>                                  # continue from existing artifacts
+```
+
+**Stage names:** `deliberate`, `gate`, `decompose`, `build`, `verify`, `harden`, `integrate`.
+
+**Prerequisite validation:** each stage declares its required input files (e.g. `build` needs `subtasks.json`; `verify` needs `gate.py`; `integrate` needs `plan.md`). The chain validates that every required file is either produced by an earlier stage in the chain OR already present in the artifacts dir. On missing prerequisites, the command fails loudly before any spawn.
+
+**Shared conductor:** `/chain` uses the same extracted stage functions, the same cast sheet (rows = union of involved roles), and the same board widget and halt semantics as `/gauntlet`. `/gauntlet <prompt>` is equivalent to `/chain deliberate,gate,decompose,build,verify,harden,integrate <prompt>`.
 
 ### `/roles` command
 

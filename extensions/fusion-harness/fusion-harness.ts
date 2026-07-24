@@ -576,6 +576,791 @@ function mdLines(text: string, colW: number): string[] {
 	}
 }
 
+// ═══ 5b. Stage extraction — shared stage functions (gauntlet-pipeline) ═══════
+// Every pipeline stage function returns its results; the same function is called by
+// both the standalone command and the pipeline conductor. The standalone commands
+// format their own panels; the conductor delegates to the board widget.
+
+/** Council stage 1: parallel panelist answers (fresh ephemeral sessions). */
+async function councilPanelAnswers(opts: {
+	prompt: string;
+	panelModels: string[];
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+}): Promise<{ runs: AgentRun[]; survivors: number[]; answersBlock: string; letters: string[]; letterOf: (idx: number) => string }> {
+	const { prompt, panelModels, artifactsDir, signal, cwd, timeoutMs } = opts;
+	const panelRuns: AgentRun[] = panelModels.map((m) => newRun("PANEL", m));
+	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	await Promise.all(
+		panelRuns.map((run) =>
+			runChild({
+				run,
+				prompt: fill("USER_PROMPT_COUNCIL_PANELIST.md", { PROMPT: prompt }),
+				tools: OPINION_TOOLS,
+				thinking: "medium",
+				...ephemeralSpawn(artifactsDir, `panelist-${run.model}`),
+				cwd,
+				timeoutMs,
+				signal,
+			}),
+		),
+	);
+	for (let i = 0; i < panelRuns.length; i++)
+		await gSave(artifactsDir, `panel-answer-${i}.md`, runOk(panelRuns[i]!) ? panelRuns[i]!.text : `FAILED: ${runError(panelRuns[i]!)}`);
+	const survivorIdx = panelRuns.map((r, i) => (runOk(r) ? i : -1)).filter((i) => i >= 0);
+	const stripModel = (text: string, model: string): string => {
+		let t = text;
+		for (const p of model.split("/")) if (p && p.length > 3) t = t.replace(new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]");
+		return t;
+	};
+	const letterOf = (idx: number) => letters[survivorIdx.indexOf(idx)] ?? "?";
+	const answers = survivorIdx.map((idx) => ({ letter: letterOf(idx), text: stripModel(panelRuns[idx]!.text, panelRuns[idx]!.model) }));
+	const answersBlock = answers.map((a) => `### Response ${a.letter}\n${a.text}`).join("\n\n");
+	await gSave(artifactsDir, "anonymized-answers.md", answersBlock);
+	return { runs: panelRuns, survivors: survivorIdx, answersBlock, letters, letterOf };
+}
+
+/** Council stage 2: each panelist ranks the anonymized answers (fresh ephemeral). */
+async function councilRanking(opts: {
+	prompt: string;
+	answersBlock: string;
+	panelModels: string[];
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+}): Promise<{ rankRuns: AgentRun[] }> {
+	const { prompt, answersBlock, panelModels, artifactsDir, signal, cwd, timeoutMs } = opts;
+	const rankRuns: AgentRun[] = panelModels.map((m) => newRun("PANEL", m));
+	await Promise.all(
+		rankRuns.map((run) =>
+			runChild({
+				run,
+				prompt: fill("USER_PROMPT_COUNCIL_RANKING.md", { PROMPT: prompt, ANSWERS: answersBlock }),
+				tools: OPINION_TOOLS,
+				thinking: "medium",
+				...ephemeralSpawn(artifactsDir, `ranking-${run.model}`),
+				cwd,
+				timeoutMs,
+				signal,
+			}),
+		),
+	);
+	return { rankRuns };
+}
+
+/** Council stage 3a: Borda aggregation (pure code, no agent calls). */
+interface BordaResult { rankingTable: string; excluded: string[]; borda: Map<string, number>; }
+function councilBorda(rankRuns: AgentRun[], validLetters: Set<string>, n: number, survivorIdx: number[]): BordaResult {
+	const borda = new Map<string, number>();
+	for (const l of validLetters) borda.set(l, 0);
+	const excluded: string[] = [];
+	for (let ri = 0; ri < rankRuns.length; ri++) {
+		const r = rankRuns[ri]!;
+		if (!runOk(r)) {
+			excluded.push(`Panelist ${survivorIdx[ri]}: ranking failed`);
+			continue;
+		}
+		const ranked: string[] = [];
+		for (const line of r.text.split("\n")) {
+			const m = line.trim().match(/^([A-Z])\s*—/);
+			if (m && validLetters.has(m[1]!)) ranked.push(m[1]!);
+		}
+		if (new Set(ranked).size !== n || ranked.length !== n) {
+			excluded.push(`Panelist ${survivorIdx[ri]}: malformed ranking`);
+			continue;
+		}
+		for (let pos = 0; pos < ranked.length; pos++) borda.set(ranked[pos]!, (borda.get(ranked[pos]!) ?? 0) + (n - pos));
+	}
+	const rankingTable = [...borda.entries()]
+		.sort((a, b) => b[1] - a[1])
+		.map(([l, s], i) => `${i + 1}. Response ${l} — ${s} pts`)
+		.join("\n");
+	return { rankingTable, excluded, borda };
+}
+
+/** Council stage 3b: chairman synthesis (fresh ephemeral). */
+async function councilChairman(opts: {
+	prompt: string;
+	answersBlock: string;
+	rankingTable: string;
+	chairmanModel: string;
+	excludedNote: string;
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+}): Promise<{ chairman: AgentRun }> {
+	const { prompt, answersBlock, rankingTable, chairmanModel, excludedNote, artifactsDir, signal, cwd, timeoutMs } = opts;
+	const chairman = newRun("CHAIRMAN", chairmanModel);
+	await runChild({
+		run: chairman,
+		prompt: fill("USER_PROMPT_COUNCIL_CHAIRMAN.md", { PROMPT: prompt, ANSWERS: answersBlock, RANKING_TABLE: rankingTable + excludedNote }),
+		tools: READONLY_TOOLS,
+		thinking: "medium",
+		...ephemeralSpawn(artifactsDir, "chairman"),
+		cwd,
+		timeoutMs,
+		signal,
+	});
+	await gSave(artifactsDir, "chairman.md", runOk(chairman) ? chairman.text : `FAILED: ${runError(chairman)}`);
+	return { chairman };
+}
+
+// ═══ 5c. Validator-gate stage functions (extracted from /auto-validate) ═══════
+
+/** Validator designs the acceptance gate (before any build). Returns the script or undefined. */
+async function validatorDesignGate(opts: {
+	prompt: string;
+	validatorModel: string;
+	scriptPath: string;
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+	sessionDir: string;
+	sessionId: string;
+}): Promise<{ validator: AgentRun; script: string | undefined; scriptPath: string }> {
+	const { prompt, validatorModel, scriptPath, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId } = opts;
+	const validator = newRun("VALIDATOR", validatorModel);
+	await runChild({
+		run: validator,
+		prompt: fill("USER_PROMPT_VALIDATOR.md", { PROMPT: prompt, CWD: cwd, GATE_PATH: scriptPath, ARTIFACTS_DIR: path.dirname(scriptPath) }),
+		systemPrompt: fill("SYSTEM_PROMPT_VALIDATOR.md", { GATE_PATH: scriptPath }),
+		tools: VALIDATOR_TOOLS,
+		thinking: "medium",
+		sessionDir,
+		sessionId,
+		cwd,
+		timeoutMs,
+		signal,
+	});
+	await gSave(artifactsDir, "validator.md", runOk(validator) ? validator.text : `FAILED: ${runError(validator)}`);
+	let script: string | undefined;
+	if (runOk(validator)) {
+		try {
+			script = ensureGateMetadata(await fs.promises.readFile(scriptPath, "utf-8"));
+		} catch {
+			script = undefined;
+		}
+		if (!script) script = extractGateScript(validator.text);
+	}
+	return { validator, script, scriptPath };
+}
+
+/** Run a gate script and capture the result. */
+async function runGateScript(scriptPath: string, cwd: string, signal?: AbortSignal): Promise<{ code: number; output: string }> {
+	return runProc("uv", ["run", scriptPath], cwd, GATE_TIMEOUT_MS, signal);
+}
+
+/** Baseline gate run — must fail RED before building. Returns { ok: true } if it ran (even on fail). */
+async function validatorGateBaseline(scriptPath: string, cwd: string, artifactsDir: string, signal?: AbortSignal): Promise<{
+	result: { code: number; output: string };
+	harnessError?: string;
+}> {
+	const result = await runGateScript(scriptPath, cwd, signal);
+	await gSave(artifactsDir, "gate-baseline.txt", `exit ${result.code}\n\n${result.output}`);
+	const harnessErr =
+		result.code === 124 || result.output.includes("[gate timed out]")
+			? "the gate timed out (gates must finish in <60s)"
+			: result.code === 127 || /failed to spawn|spawn error/.test(result.output)
+				? "the gate could not be executed — is `uv` installed and on PATH?"
+				: undefined;
+	return { result, harnessError: harnessErr };
+}
+
+/** One round of the gate correction loop: build → validate → fail/pass. */
+async function gateCorrectionRound(opts: {
+	round: number;
+	maxRounds: number;
+	prompt: string;
+	script: string;
+	scriptPath: string;
+	builderModel: string;
+	artifactsDir: string;
+	spawn: { sessionDir: string; sessionId?: string; resume?: string; fork?: string };
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+	systemPrompt?: string;
+}): Promise<{ builder: AgentRun; gateResult: { code: number; output: string }; previousGate?: { code: number; output: string } }> {
+	const { round, maxRounds, prompt, script, scriptPath, builderModel, artifactsDir, spawn, signal, cwd, timeoutMs, systemPrompt } = opts;
+	const builder = newRun("BUILDER", builderModel);
+	const isFirst = round === 1;
+	await runChild({
+		run: builder,
+		prompt: isFirst
+			? fill("USER_PROMPT_BUILDER.md", { PROMPT: prompt, GATE_SCRIPT: script })
+			: fill("USER_PROMPT_CORRECTION.md", {
+					ROUND: String(round),
+					MAX_ROUNDS: String(maxRounds),
+					REMAINING: `${maxRounds - round + 1} attempt${maxRounds - round === 1 ? "" : "s"} remain`,
+					GATE_EXIT_CODE: "0",
+					GATE_OUTPUT: "",
+					TRIAGE_BLOCK: "",
+					GATE_UPDATE_BLOCK: "",
+				}),
+		systemPrompt,
+		tools: FULL_TOOLS,
+		thinking: "medium",
+		...spawn,
+		cwd,
+		timeoutMs,
+		signal,
+	});
+	await gSave(artifactsDir, `builder-round-${round}.md`, runOk(builder) ? builder.text : `FAILED: ${runError(builder)}`);
+	const gateResult = await runGateScript(scriptPath, cwd, signal);
+	await gSave(artifactsDir, `gate-round-${round}.txt`, `exit ${gateResult.code}\n\n${gateResult.output}`);
+	return { builder, gateResult };
+}
+
+/** Escalation: validator triage — diagnoses builder failures and optionally repairs the gate. */
+async function validatorTriage(opts: {
+	prompt: string;
+	round: number;
+	maxRounds: number;
+	builderText: string;
+	gateHistory: Array<{ round: number; code: number; output: string }>;
+	validatorModel: string;
+	artifactsDir: string;
+	scriptPath: string;
+	script: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+	sessionDir: string;
+	sessionId: string;
+	gateRepairUsed: boolean;
+}): Promise<{ triageText?: string; repairedScript?: string; newGateRepairUsed: boolean }> {
+	const { prompt, round, maxRounds, builderText, gateHistory, validatorModel, artifactsDir, scriptPath, script, signal, cwd, timeoutMs, sessionDir, sessionId, gateRepairUsed } = opts;
+	let gateBefore: string | undefined;
+	try {
+		gateBefore = await fs.promises.readFile(scriptPath, "utf-8");
+	} catch {
+		gateBefore = script;
+	}
+	const triageVal = newRun("VALIDATOR", validatorModel);
+	const history = gateHistory
+		.slice(-2)
+		.map((g) => `## Gate run — round ${g.round} (exit ${g.code})\n\`\`\`\n${truncateChars(g.output.trim() || "(no output)", 6_000)}\n\`\`\``)
+		.join("\n\n");
+	await runChild({
+		run: triageVal,
+		prompt: fill("USER_PROMPT_TRIAGE.md", {
+			FAILURES: String(round),
+			FAILURES_PLURAL: round === 1 ? "" : "s",
+			MAX_ROUNDS: String(maxRounds),
+			REQUEST: prompt,
+			HISTORY_SUFFIX: gateHistory.length > 1 ? "S (note what changed — or didn't — between rounds)" : "",
+			GATE_HISTORY: history,
+			BUILDER_REPORT: truncateChars(builderText, 12_000),
+			ARTIFACTS_DIR: artifactsDir,
+		}),
+		systemPrompt: fill("SYSTEM_PROMPT_TRIAGE.md", { GATE_PATH: scriptPath }),
+		tools: gateRepairUsed ? READONLY_TOOLS : VALIDATOR_TOOLS,
+		thinking: "medium",
+		sessionDir,
+		sessionId,
+		cwd,
+		timeoutMs,
+		signal,
+	});
+	await gSave(artifactsDir, `triage-round-${round}.md`, runOk(triageVal) ? triageVal.text : `FAILED: ${runError(triageVal)}`);
+	let repairedScript: string | undefined;
+	let newGateRepairUsed = gateRepairUsed;
+	if (runOk(triageVal) && !gateRepairUsed) {
+		let gateAfter: string | undefined;
+		try {
+			gateAfter = await fs.promises.readFile(scriptPath, "utf-8");
+		} catch {
+			gateAfter = undefined;
+		}
+		if (gateAfter?.trim() && gateAfter !== gateBefore) {
+			newGateRepairUsed = true;
+			await gSave(artifactsDir, `gate.py.r${round}`, gateBefore!);
+			repairedScript = ensureGateMetadata(gateAfter) ?? gateAfter;
+		}
+	}
+	return { triageText: runOk(triageVal) ? triageVal.text : undefined, repairedScript, newGateRepairUsed };
+}
+
+/** Full gate correction loop: build → validate → escalate/repair → repeat until green or cap. */
+async function gateCorrectionLoop(opts: {
+	prompt: string;
+	script: string;
+	scriptPath: string;
+	validatorModel: string;
+	builderModel: string;
+	maxRounds: number;
+	escalateAt: number;
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+	builderSystemPrompt?: string;
+	sessionDir: string;
+	sessionId: string;
+}): Promise<{
+	builder: AgentRun;
+	validator: AgentRun;
+	green: boolean;
+	gateHistory: Array<{ round: number; code: number; output: string }>;
+	rounds: number;
+	gateRepaired: boolean;
+}> {
+	const { prompt, script, scriptPath, validatorModel, builderModel, maxRounds, escalateAt, artifactsDir, signal, cwd, timeoutMs, builderSystemPrompt, sessionDir, sessionId } = opts;
+	const validator = newRun("VALIDATOR", validatorModel);
+	let lastGate: { code: number; output: string } | undefined;
+	const gateHistory: Array<{ round: number; code: number; output: string }> = [];
+	let gateRepairUsed = false;
+	let pendingTriage: string | undefined;
+	let currentScript = script;
+	let builder: AgentRun = newRun("BUILDER", builderModel);
+
+	for (let round = 1; round <= maxRounds; round++) {
+		const spawn: { sessionDir: string; fork?: string; resume?: string } = {
+			sessionDir: path.join(artifactsDir, "builder"),
+		};
+		if (round === 1 && builder.sessionRef) spawn.resume = builder.sessionRef;
+
+		const { builder: b, gateResult } = await gateCorrectionRound({
+			round,
+			maxRounds,
+			prompt,
+			script: currentScript,
+			scriptPath,
+			builderModel,
+			artifactsDir,
+			spawn,
+			signal,
+			cwd,
+			timeoutMs,
+			systemPrompt: builderSystemPrompt,
+		});
+		builder = b;
+		gateHistory.push({ round, code: gateResult.code, output: gateResult.output });
+
+		if (gateResult.code === 0) {
+			return { builder, validator, green: true, gateHistory, rounds: round, gateRepaired: gateRepairUsed };
+		}
+
+		// Escalation
+		if (round >= escalateAt && round < maxRounds) {
+			const triageResult = await validatorTriage({
+				prompt,
+				round,
+				maxRounds,
+				builderText: b.text,
+				gateHistory,
+				validatorModel,
+				artifactsDir,
+				scriptPath,
+				script: currentScript,
+				signal,
+				cwd,
+				timeoutMs,
+				sessionDir,
+				sessionId,
+				gateRepairUsed,
+			});
+			gateRepairUsed = triageResult.newGateRepairUsed;
+			pendingTriage = triageResult.triageText;
+			if (triageResult.repairedScript) {
+				currentScript = triageResult.repairedScript;
+				// Free re-run on repaired gate
+				const rerun = await runGateScript(scriptPath, cwd, signal);
+				gateHistory.push({ round, code: rerun.code, output: rerun.output });
+				if (rerun.code === 0) {
+					return { builder, validator, green: true, gateHistory, rounds: round, gateRepaired: true };
+				}
+			}
+		}
+		lastGate = gateResult;
+	}
+
+	return { builder, validator, green: false, gateHistory, rounds: maxRounds, gateRepaired: gateRepairUsed };
+}
+
+// ═══ 5d. Coordinator stage functions (extracted from /coordinate) ═══════════
+
+/** Coordinator stage 1: decompose the prompt into a subtasks.json manifest. */
+async function coordinatorDecompose(opts: {
+	prompt: string;
+	coordinatorModel: string;
+	subtasksPath: string;
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+	sessionDir: string;
+	sessionId: string;
+}): Promise<{
+	coordinator: AgentRun;
+	manifest: SubtaskManifest | undefined;
+	levels: SubtaskEntry[][] | undefined;
+	error?: string;
+}> {
+	const { prompt, coordinatorModel, subtasksPath, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId } = opts;
+	const coordinator = newRun("COORDINATOR", coordinatorModel);
+	await runChild({
+		run: coordinator,
+		prompt: fill("USER_PROMPT_COORDINATOR.md", { MODEL: coordinatorModel, SUBTASKS_PATH: subtasksPath, PROMPT: prompt }),
+		tools: VALIDATOR_TOOLS,
+		thinking: "medium",
+		sessionDir,
+		sessionId,
+		cwd,
+		timeoutMs,
+		signal,
+	});
+	await gSave(artifactsDir, "coordinator.md", coordinator.text);
+	if (!runOk(coordinator)) return { coordinator, manifest: undefined, levels: undefined, error: `Coordinator failed: ${runError(coordinator)}` };
+
+	const manifestRaw = await fs.promises.readFile(subtasksPath, "utf-8").catch(() => undefined);
+	if (!manifestRaw) return { coordinator, manifest: undefined, levels: undefined, error: `COORDINATOR did not write subtasks.json to ${subtasksPath}` };
+
+	let parsed: any;
+	try {
+		parsed = JSON.parse(manifestRaw);
+	} catch (err) {
+		return { coordinator, manifest: undefined, levels: undefined, error: `subtasks.json is not valid JSON: ${String(err)}` };
+	}
+	const validation = validateManifest(parsed);
+	if (!validation.ok) return { coordinator, manifest: undefined, levels: undefined, error: `Invalid manifest: ${validation.error}` };
+
+	const { levels, error: topoError } = topoLevels(validation.manifest.subtasks!);
+	if (topoError) return { coordinator, manifest: undefined, levels: undefined, error: `Dependency error: ${topoError}` };
+
+	return { coordinator, manifest: validation.manifest, levels };
+}
+
+/** Coordinator stage 2: execute workers in dependency levels (fresh ephemeral). */
+async function coordinatorWorkerLevels(opts: {
+	levels: SubtaskEntry[][];
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+}): Promise<{ workerRuns: Array<{ entry: SubtaskEntry; run: AgentRun }> }> {
+	const { levels, artifactsDir, signal, cwd, timeoutMs } = opts;
+	const workerRuns: Array<{ entry: SubtaskEntry; run: AgentRun }> = [];
+	const bModel = castModel("BUILDER");
+	for (let li = 0; li < levels.length; li++) {
+		const lvl = levels[li]!.map((entry) => ({
+			entry,
+			run: newRun("BUILDER", bModel),
+		}));
+		await Promise.all(
+			lvl.map(({ entry, run }) =>
+				runChild({
+					run,
+					prompt: fill("USER_PROMPT_COORDINATOR_WORKER.md", {
+						OWNED_PATHS: (entry.paths ?? []).join(", "),
+						TITLE: entry.title ?? entry.id,
+						PROMPT: entry.prompt ?? "",
+					}),
+					tools: FULL_TOOLS,
+					thinking: "medium",
+					...ephemeralSpawn(artifactsDir, `worker-${entry.id}`),
+					cwd,
+					timeoutMs,
+					signal,
+				}),
+			),
+		);
+		for (const { entry, run } of lvl) {
+			workerRuns.push({ entry, run });
+			await gSave(artifactsDir, `worker-${entry.id}.md`, runOk(run) ? run.text : `FAILED: ${runError(run)}`);
+		}
+	}
+	return { workerRuns };
+}
+
+/** Coordinator stage 3: integrate — coordinator verifies results, with one fix-up pass. */
+async function coordinatorIntegrate(opts: {
+	prompt: string;
+	coordinatorModel: string;
+	workerRuns: Array<{ entry: SubtaskEntry; run: AgentRun }>;
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+	sessionDir: string;
+	sessionId: string;
+	noFixUp?: boolean;
+}): Promise<{ coordinator: AgentRun; fixupApplied: boolean }> {
+	const { prompt, coordinatorModel, workerRuns, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId, noFixUp } = opts;
+	const coordinator = newRun("COORDINATOR", coordinatorModel);
+	const results = workerRuns
+		.map(
+			({ entry, run }) =>
+				`### ${entry.id}: ${entry.title ?? ""}\n${runOk(run) ? "✓ done" : `✗ failed: ${runError(run)}`}\n${truncateChars(run.text, Math.floor(HANDOFF_MAX / Math.max(1, workerRuns.length)))}`,
+		)
+		.join("\n\n");
+
+	await runChild({
+		run: coordinator,
+		prompt: fill("USER_PROMPT_COORDINATOR_INTEGRATION.md", {
+			MODEL: coordinatorModel,
+			PROMPT: prompt,
+			SUBTASK_RESULTS: results,
+			FIXUP_BLOCK: noFixUp ? "" : "\nIf you find gaps, you will get ONE fix-up pass with FULL_TOOLS.",
+			FIXUP_NOTE: "",
+		}),
+		tools: READONLY_TOOLS,
+		thinking: "medium",
+		sessionDir,
+		sessionId,
+		cwd,
+		timeoutMs,
+		signal,
+	});
+	await gSave(artifactsDir, "integration.md", coordinator.text);
+
+	let fixupApplied = false;
+	if (!noFixUp && /gap|missing|incomplete|not satisfied/i.test(coordinator.text)) {
+		fixupApplied = true;
+		await runChild({
+			run: coordinator,
+			prompt: fill("USER_PROMPT_COORDINATOR_INTEGRATION.md", {
+				MODEL: coordinatorModel,
+				PROMPT: prompt,
+				SUBTASK_RESULTS: results,
+				FIXUP_BLOCK: "",
+				FIXUP_NOTE: `\n# FIX-UP PASS — Address the gaps with FULL_TOOLS, then render the final report.\n${coordinator.text.slice(-2000)}`,
+			}),
+			tools: FULL_TOOLS,
+			thinking: "medium",
+			sessionDir,
+			sessionId,
+			cwd,
+			timeoutMs,
+			signal,
+		});
+		await gSave(artifactsDir, "integration-fixup.md", coordinator.text);
+	}
+
+	return { coordinator, fixupApplied };
+}
+
+/** Full coordinate pipeline: decompose → workers → integrate. */
+async function coordinatePipeline(opts: {
+	prompt: string;
+	coordinatorModel: string;
+	subtasksPath: string;
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+	sessionDir: string;
+	sessionId: string;
+	noFixUp?: boolean;
+}): Promise<{ coordinator: AgentRun; workerRuns: Array<{ entry: SubtaskEntry; run: AgentRun }>; manifest?: SubtaskManifest; levels?: SubtaskEntry[][]; error?: string; fixupApplied: boolean; ok: boolean }> {
+	const { prompt, coordinatorModel, subtasksPath, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId, noFixUp } = opts;
+	const { coordinator, manifest, levels, error } = await coordinatorDecompose({ prompt, coordinatorModel, subtasksPath, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId });
+	if (error || !manifest || !levels) return { coordinator, workerRuns: [], error: error ?? "Unknown error", fixupApplied: false, ok: false };
+
+	const { workerRuns } = await coordinatorWorkerLevels({ levels, artifactsDir, signal, cwd, timeoutMs });
+	const { coordinator: coordFinal, fixupApplied } = await coordinatorIntegrate({ prompt, coordinatorModel, workerRuns, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId, noFixUp });
+	return { coordinator: coordFinal, workerRuns, manifest, levels, fixupApplied, ok: runOk(coordFinal) };
+}
+
+// ═══ 5e. Redteam stage functions (extracted from /redteam) ═══════════════════
+
+/** Redteam build stage: initial build by the builder. */
+async function redteamBuild(opts: {
+	prompt: string;
+	builderModel: string;
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+	spawn: { sessionDir: string; fork?: string; sessionId?: string };
+	systemPrompt?: string;
+}): Promise<{ builder: AgentRun }> {
+	const { prompt, builderModel, artifactsDir, signal, cwd, timeoutMs, spawn, systemPrompt } = opts;
+	const builder = newRun("BUILDER", builderModel);
+	await runChild({
+		run: builder,
+		prompt: fill("USER_PROMPT_REDTEAM_BUILDER.md", { PROMPT: prompt, ROUND: "1", NOTE: "" }),
+		systemPrompt,
+		tools: FULL_TOOLS,
+		thinking: "medium",
+		...spawn,
+		cwd,
+		timeoutMs,
+		signal,
+	});
+	await gSave(artifactsDir, "builder-round-1.md", runOk(builder) ? builder.text : `FAILED: ${runError(builder)}`);
+	return { builder };
+}
+
+/** Redteam sortie stage: attacker probes, returns verdict. */
+async function redteamSortie(opts: {
+	prompt: string;
+	attackerModel: string;
+	round: number;
+	maxRounds: number;
+	lastBreach: string;
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+	sessionDir: string;
+	sessionId: string;
+}): Promise<{ attacker: AgentRun; verdict: string | undefined; concede: boolean; breachText: string }> {
+	const { prompt, attackerModel, round, maxRounds, lastBreach, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId } = opts;
+	const attacker = newRun("ATTACKER", attackerModel);
+	await runChild({
+		run: attacker,
+		prompt: fill("USER_PROMPT_REDTEAM_ATTACKER.md", {
+			PROMPT: prompt,
+			ROUND: String(round),
+			MAX_ROUNDS: String(maxRounds),
+			BREACH_NOTE: lastBreach ? `\nPrevious breach: ${lastBreach.slice(0, 2000)}` : "",
+		}),
+		tools: OPINION_TOOLS,
+		thinking: "medium",
+		sessionDir,
+		sessionId,
+		cwd,
+		timeoutMs,
+		signal,
+	});
+	await gSave(artifactsDir, `attacker-round-${round}.md`, runOk(attacker) ? attacker.text : `FAILED: ${runError(attacker)}`);
+	const verdict = parseStrictVerdictLine(attacker.text, "VERDICT");
+	const concede = verdict?.toUpperCase() === "CONCEDE";
+	const breachText = truncateChars(attacker.text, HANDOFF_MAX);
+	return { attacker, verdict, concede, breachText };
+}
+
+/** Redteam sortie loop: probe → patch → probe until concede or cap. */
+async function redteamSortieLoop(opts: {
+	prompt: string;
+	attackerModel: string;
+	builderModel: string;
+	rounds: number;
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+	attackerSessionDir: string;
+	attackerSessionId: string;
+	builderSystemPrompt?: string;
+	builderSpawn: { sessionDir: string; fork?: string; sessionId?: string };
+}): Promise<{
+	builder: AgentRun;
+	attacker: AgentRun;
+	concede: boolean;
+	sorties: number;
+	lastBreach: string;
+}> {
+	const {
+		prompt,
+		attackerModel,
+		builderModel,
+		rounds,
+		artifactsDir,
+		signal,
+		cwd,
+		timeoutMs,
+		attackerSessionDir,
+		attackerSessionId,
+		builderSystemPrompt,
+		builderSpawn,
+	} = opts;
+
+	// Initial build
+	const { builder } = await redteamBuild({ prompt, builderModel, artifactsDir, signal, cwd, timeoutMs, spawn: builderSpawn, systemPrompt: builderSystemPrompt });
+	if (!runOk(builder)) return { builder, attacker: newRun("ATTACKER", attackerModel), concede: false, sorties: 0, lastBreach: "" };
+
+	let lastBreach = "";
+	let finalAttacker = newRun("ATTACKER", attackerModel);
+	let concede = false;
+	let verdictMissed = false;
+	let round: number;
+
+	for (round = 1; round <= rounds; round++) {
+		const { attacker, verdict, concede: c, breachText } = await redteamSortie({
+			prompt,
+			attackerModel,
+			round,
+			maxRounds: rounds,
+			lastBreach,
+			artifactsDir,
+			signal,
+			cwd,
+			timeoutMs,
+			sessionDir: attackerSessionDir,
+			sessionId: attackerSessionId,
+		});
+		finalAttacker = attacker;
+
+		if (!verdict) {
+			if (verdictMissed) break;
+			verdictMissed = true;
+			round--;
+			continue;
+		}
+		verdictMissed = false;
+
+		if (c) {
+			concede = true;
+			break;
+		}
+
+		// BREACH: patch the builder
+		lastBreach = breachText;
+		await runChild({
+			run: builder,
+			prompt: fill("USER_PROMPT_REDTEAM_BUILDER.md", {
+				PROMPT: prompt,
+				ROUND: String(round + 1),
+				NOTE: `\n# BREACH REPORT (sortie ${round}) — Address this:\n${lastBreach}`,
+			}),
+			systemPrompt: builderSystemPrompt,
+			tools: FULL_TOOLS,
+			thinking: "medium",
+			...(builder.sessionRef ? { sessionDir: builderSpawn.sessionDir, resume: builder.sessionRef } : builderSpawn),
+			cwd,
+			timeoutMs,
+			signal,
+		});
+		await gSave(artifactsDir, `builder-round-${round + 1}.md`, runOk(builder) ? builder.text : `FAILED: ${runError(builder)}`);
+	}
+
+	return { builder, attacker: finalAttacker, concede, sorties: round, lastBreach };
+}
+
+/** Full council pipeline: panel answers → ranking → Borda → chairman. Returns chairman synthesis text. */
+async function councilPipeline(opts: {
+	prompt: string;
+	panelModels: string[];
+	chairmanModel: string;
+	artifactsDir: string;
+	signal?: AbortSignal;
+	cwd: string;
+	timeoutMs: number;
+}): Promise<{ synthesis: string; chairman: AgentRun; allRuns: AgentRun[] }> {
+	const { prompt, panelModels, chairmanModel, artifactsDir, signal, cwd, timeoutMs } = opts;
+	// Stage 1: panel answers
+	const { runs: panelRuns, survivors: survivorIdx, answersBlock, letterOf } = await councilPanelAnswers({ prompt, panelModels, artifactsDir, signal, cwd, timeoutMs });
+	if (survivorIdx.length < 2) {
+		return { synthesis: "", chairman: newRun("CHAIRMAN", chairmanModel), allRuns: panelRuns };
+	}
+	// Stage 2: ranking
+	const { rankRuns } = await councilRanking({ prompt, answersBlock, panelModels, artifactsDir, signal, cwd, timeoutMs });
+	// Stage 3a: Borda
+	const validLetters = new Set(survivorIdx.map((idx) => letterOf(idx)));
+	const { rankingTable, excluded } = councilBorda(rankRuns, validLetters, validLetters.size, survivorIdx);
+	const exclNote = excluded.length ? `\n\n**Excluded:**\n${excluded.join("\n")}` : "";
+	// Stage 3b: chairman
+	const { chairman } = await councilChairman({ prompt, answersBlock, rankingTable, chairmanModel, excludedNote: exclNote, artifactsDir, signal, cwd, timeoutMs });
+	return { synthesis: runOk(chairman) ? chairman.text : "", chairman, allRuns: [...panelRuns, ...rankRuns, chairman] };
+}
+
 // ═══ 6. Child runner ═════════════════════════════════════════════════════════
 
 /**
@@ -1480,6 +2265,18 @@ function borderBox(lines: string[], innerW: number): string[] {
 	return [top, ...body, bot];
 }
 
+// ═══ 7c. Artifact utilities (global for stage functions) ════════════════════
+// Per-run artifacts land under /tmp/fusion-harness-* (the spec'd, inspectable location —
+// note os.tmpdir() on macOS is /var/folders/…, so we pin /tmp explicitly).
+const ARTIFACT_ROOT_G = fs.existsSync("/tmp") ? "/tmp" : os.tmpdir();
+const mkArtifacts = async (): Promise<string> => fs.promises.mkdtemp(path.join(ARTIFACT_ROOT_G, "fusion-harness-"));
+const gSave = (dir: string, name: string, body: string) =>
+	fs.promises.writeFile(path.join(dir, name), body, "utf-8").catch(() => {});
+const gTotals = (runs: AgentRun[], startedAt: number) => ({
+	totalMs: Date.now() - startedAt,
+	totalCostUsd: runs.reduce((s, r) => s + r.costUsd, 0),
+});
+
 // ═══ 8. Extension ════════════════════════════════════════════════════════════
 
 export default function (pi: ExtensionAPI) {
@@ -2334,16 +3131,9 @@ export default function (pi: ExtensionAPI) {
 		return { signal: ctl.signal, stopped: () => ctl.signal.aborted, release };
 	};
 
-	// Per-run artifacts land under /tmp/fusion-harness-* (the spec'd, inspectable location —
-	// note os.tmpdir() on macOS is /var/folders/…, so we pin /tmp explicitly).
-	const ARTIFACT_ROOT = fs.existsSync("/tmp") ? "/tmp" : os.tmpdir();
-	const mkArtifacts = async (): Promise<string> => fs.promises.mkdtemp(path.join(ARTIFACT_ROOT, "fusion-harness-"));
-	const save = (dir: string, name: string, body: string) =>
-		fs.promises.writeFile(path.join(dir, name), body, "utf-8").catch(() => {});
-	const totals = (runs: AgentRun[], startedAt: number) => ({
-		totalMs: Date.now() - startedAt,
-		totalCostUsd: runs.reduce((s, r) => s + r.costUsd, 0),
-	});
+	// Use global artifact utilities
+	const save = gSave;
+	const totals = gTotals;
 
 	// ── 8.7b Preflight: validate every cast model resolves + is authenticated ──
 	type PreflightFailure = { role: Role; model: string; kind: "unresolved" | "no-auth"; provider: string; id: string };
@@ -2485,6 +3275,7 @@ export default function (pi: ExtensionAPI) {
 		coordinate: ["COORDINATOR"],
 		council: ["PANEL", "CHAIRMAN"],
 		redteam: ["ATTACKER", "BUILDER"],
+		gauntlet: ["PANEL", "CHAIRMAN", "VALIDATOR", "COORDINATOR", "BUILDER", "ATTACKER"],
 	};
 	const runCastGate = async (ctx: any, command: string, skip: boolean): Promise<boolean> => {
 		const roles = COMMAND_CAST[command] ?? KNOWN_ROLES;
@@ -3718,6 +4509,853 @@ export default function (pi: ExtensionAPI) {
 			} finally {
 				stopper.release(); // never leave the escape tap installed past the command
 				stopWidget();
+				ctx.ui.setStatus(CUSTOM_TYPE, undefined);
+			}
+		},
+	});
+
+	// ═══ 8.20 /gauntlet — full campaign pipeline ════════════════════════════════
+	const GAUNTLET_STAGES = ["deliberate", "gate", "decompose", "build", "verify", "harden", "integrate"] as const;
+	type GauntletStage = (typeof GAUNTLET_STAGES)[number];
+	const GAUNTLET_STAGE_NAMES: Record<GauntletStage, string> = {
+		deliberate: "DELIBERATE",
+		gate: "GATE-FIRST",
+		decompose: "DECOMPOSE",
+		build: "BUILD",
+		verify: "VERIFY",
+		harden: "HARDEN",
+		integrate: "INTEGRATE",
+	};
+	interface StageState {
+		name: string;
+		status: "pending" | "working" | "done" | "failed" | "skipped";
+		artifacts: Record<string, string>;
+		startedAt?: string;
+		endedAt?: string;
+		prompt?: string;
+		castSnapshot?: Cast;
+		tokensIn?: number;
+		tokensOut?: number;
+		costUsd?: number;
+	}
+	interface CampaignState {
+		prompt: string;
+		stages: StageState[];
+		cast: Cast;
+		createdAt: string;
+		skipCouncil: boolean;
+		skipRedteam: boolean;
+		deliberateMode: "council" | "debate";
+	}
+
+	const emptyStage = (name: string): StageState => ({
+		name,
+		status: "pending",
+		artifacts: {},
+	});
+
+	/** Load campaign state from a dir with state.json. */
+	const loadCampaignState = async (dir: string): Promise<CampaignState> => {
+		const raw = await fs.promises.readFile(path.join(dir, "state.json"), "utf-8");
+		return JSON.parse(raw) as CampaignState;
+	};
+
+	/** Save campaign state to the dir's state.json. */
+	const saveCampaignState = async (dir: string, state: CampaignState): Promise<void> => {
+		await gSave(dir, "state.json", JSON.stringify(state, null, 2));
+	};
+
+	/** Find the latest gauntlet-* dir in /tmp (or ARTIFACT_ROOT_G). */
+	const latestGauntletDir = async (): Promise<string | undefined> => {
+		const root = ARTIFACT_ROOT_G;
+		let entries: string[] = [];
+		try {
+			entries = await fs.promises.readdir(root);
+		} catch {
+			return undefined;
+		}
+		const gauntletDirs = entries
+			.filter((e) => e.startsWith("gauntlet-"))
+			.map((e) => path.join(root, e))
+			.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+		return gauntletDirs[0];
+	};
+
+	/** Find the first non-done stage in campaign state. */
+	const firstIncompleteStage = (state: CampaignState): number =>
+		state.stages.findIndex((s) => s.status !== "done");
+
+	/** Accumulate cost from stage states. */
+	const accumulateCost = (stages: StageState[]): number =>
+		stages.reduce((s, st) => s + (st.costUsd ?? 0), 0);
+
+	/**
+	 * Gauntlet stage runner — executes one stage and updates campaign state.
+	 * Returns true if the campaign should continue, false to halt.
+	 */
+	async function runGauntletStage(
+		stageIdx: number,
+		state: CampaignState,
+		dir: string,
+		prompt: string,
+		ctx: any,
+		stopper: { signal: AbortSignal; stopped: () => boolean; release: () => void },
+		campaignStartedAt: number,
+	): Promise<boolean> {
+		if (stopper.stopped()) return false;
+		const stage = state.stages[stageIdx]!;
+		stage.status = "working";
+		stage.startedAt = new Date().toISOString();
+		await saveCampaignState(dir, state);
+		ctx.ui.setStatus(CUSTOM_TYPE, `gauntlet: stage ${stageIdx + 1}/${state.stages.length} — ${stage.name}…`);
+
+		try {
+			switch (stage.name) {
+				case "DELIBERATE": {
+					if (state.skipCouncil) {
+						await gSave(dir, "plan.md", prompt);
+						stage.artifacts["plan.md"] = path.join(dir, "plan.md");
+					} else if (state.deliberateMode === "debate") {
+						// Run a debate
+						const aModel = castModel("DEBATER_A");
+						const bModel = castModel("DEBATER_B");
+						const jModel = castModel("JUDGE");
+						const aSess = roleSession("architect", ctx.cwd);
+						const debaterA = newRun("DEBATER_A", aModel);
+						const debaterB = newRun("DEBATER_B", bModel);
+						await Promise.all([
+							runChild({
+								run: debaterA,
+								prompt: fill("USER_PROMPT_DEBATE_OPENING.md", { ROLE: "DEBATER_A", MODEL: aModel, PROMPT: prompt }),
+								tools: OPINION_TOOLS,
+								thinking: castThinking("DEBATER_A"),
+								sessionDir: aSess.dir,
+								sessionId: aSess.id,
+								cwd: ctx.cwd,
+								timeoutMs: childTimeoutMs(),
+								signal: stopper.signal,
+							}),
+							runChild({
+								run: debaterB,
+								prompt: fill("USER_PROMPT_DEBATE_OPENING.md", { ROLE: "DEBATER_B", MODEL: bModel, PROMPT: prompt }),
+								tools: OPINION_TOOLS,
+								thinking: castThinking("DEBATER_B"),
+								...builderSpawn(ctx, dir),
+								cwd: ctx.cwd,
+								timeoutMs: childTimeoutMs(),
+								signal: stopper.signal,
+							}),
+						]);
+						const judge = newRun("JUDGE", jModel);
+						const transcript = `--- Round 1 ---\nDebater A:\n${debaterA.text}\n\nDebater B:\n${debaterB.text}`;
+						await gSave(dir, "transcript.md", transcript);
+						await runChild({
+							run: judge,
+							prompt: fill("USER_PROMPT_DEBATE_JUDGE.md", {
+								DEBATER_A_LABEL: "Debater A",
+								DEBATER_B_LABEL: "Debater B",
+								PROMPT: prompt,
+								TRANSCRIPT: transcript,
+							}),
+							tools: READONLY_TOOLS,
+							thinking: castThinking("JUDGE"),
+							...ephemeralSpawn(dir, "judge"),
+							cwd: ctx.cwd,
+							timeoutMs: childTimeoutMs(),
+							signal: stopper.signal,
+						});
+						await gSave(dir, "plan.md", judge.text);
+						stage.artifacts["plan.md"] = path.join(dir, "plan.md");
+					} else {
+						// Council pipeline
+						const panelRaw = cast["PANEL"]?.model ?? castModel("ARCHITECT");
+						const panelModels = panelRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
+						const cModel = castModel("CHAIRMAN");
+						const { synthesis } = await councilPipeline({
+							prompt,
+							panelModels,
+							chairmanModel: cModel,
+							artifactsDir: dir,
+							signal: stopper.signal,
+							cwd: ctx.cwd,
+							timeoutMs: childTimeoutMs(),
+						});
+						await gSave(dir, "plan.md", synthesis);
+						stage.artifacts["plan.md"] = path.join(dir, "plan.md");
+					}
+					stage.status = "done";
+					break;
+				}
+				case "GATE-FIRST": {
+					const planDigest = truncateChars(prompt, HANDOFF_MAX);
+					const scriptPath = path.join(dir, "gate.py");
+					const as = roleSession("architect", ctx.cwd);
+					const { validator, script } = await validatorDesignGate({
+						prompt: `${prompt}\n\nPlan digest:\n${planDigest}`,
+						validatorModel: castModel("VALIDATOR"),
+						scriptPath,
+						artifactsDir: dir,
+						signal: stopper.signal,
+						cwd: ctx.cwd,
+						timeoutMs: childTimeoutMs(),
+						sessionDir: as.dir,
+						sessionId: as.id,
+					});
+					if (!script) {
+						stage.status = "failed";
+						break;
+					}
+					const { result: baseline, harnessError } = await validatorGateBaseline(scriptPath, ctx.cwd, dir, stopper.signal);
+					if (harnessError || baseline.code === 0) {
+						stage.status = baseline.code === 0 ? "done" : "failed";
+						stage.artifacts["gate.py"] = scriptPath;
+						break;
+					}
+					stage.status = "done";
+					stage.artifacts["gate.py"] = scriptPath;
+					break;
+				}
+				case "DECOMPOSE": {
+					const subtasksPath = path.join(dir, "subtasks.json");
+					const as = roleSession("architect", ctx.cwd);
+					const { coordinator, manifest, levels, error } = await coordinatorDecompose({
+						prompt,
+						coordinatorModel: castModel("COORDINATOR"),
+						subtasksPath,
+						artifactsDir: dir,
+						signal: stopper.signal,
+						cwd: ctx.cwd,
+						timeoutMs: childTimeoutMs(),
+						sessionDir: as.dir,
+						sessionId: as.id,
+					});
+					if (error || !manifest || !levels) {
+						stage.status = "failed";
+					} else {
+						stage.status = "done";
+						stage.artifacts["subtasks.json"] = subtasksPath;
+					}
+					break;
+				}
+				case "BUILD": {
+					const subtasksPath = path.join(dir, "subtasks.json");
+					let subtasksRaw: string;
+					try {
+						subtasksRaw = await fs.promises.readFile(subtasksPath, "utf-8");
+					} catch {
+						stage.status = "failed";
+						break;
+					}
+					let parsed: any;
+					try {
+						parsed = JSON.parse(subtasksRaw);
+					} catch {
+						stage.status = "failed";
+						break;
+					}
+					const validation = validateManifest(parsed);
+					if (!validation.ok) {
+						stage.status = "failed";
+						break;
+					}
+					const { levels, error: topoError } = topoLevels(validation.manifest.subtasks!);
+					if (topoError) {
+						stage.status = "failed";
+						break;
+					}
+					const { workerRuns } = await coordinatorWorkerLevels({
+						levels,
+						artifactsDir: dir,
+						signal: stopper.signal,
+						cwd: ctx.cwd,
+						timeoutMs: childTimeoutMs(),
+					});
+					stage.status = "done";
+					break;
+				}
+				case "VERIFY": {
+					const scriptPath = path.join(dir, "gate.py");
+					let script: string;
+					try {
+						script = await fs.promises.readFile(scriptPath, "utf-8");
+					} catch {
+						stage.status = "failed";
+						break;
+					}
+					const as = roleSession("architect", ctx.cwd);
+					const { green, gateRepaired } = await gateCorrectionLoop({
+						prompt,
+						script,
+						scriptPath,
+						validatorModel: castModel("VALIDATOR"),
+						builderModel: castModel("BUILDER"),
+						maxRounds: clampValidations(Number.parseInt(flagStr("max-validations"), 10)),
+						escalateAt: clampCount(Number.parseInt(flagStr("escalate-to-validator-count"), 10), 3),
+						artifactsDir: dir,
+						signal: stopper.signal,
+						cwd: ctx.cwd,
+						timeoutMs: childTimeoutMs(),
+						sessionDir: as.dir,
+						sessionId: as.id,
+					});
+					stage.status = green ? "done" : "failed";
+					stage.artifacts["gate.py"] = scriptPath;
+					break;
+				}
+				case "HARDEN": {
+					if (state.skipRedteam) {
+						stage.status = "skipped";
+						break;
+					}
+					const as = roleSession("architect", ctx.cwd);
+					const bs = builderSpawn(ctx, dir);
+					const { concede } = await redteamSortieLoop({
+						prompt,
+						attackerModel: castModel("ATTACKER"),
+						builderModel: castModel("BUILDER"),
+						rounds: 3,
+						artifactsDir: dir,
+						signal: stopper.signal,
+						cwd: ctx.cwd,
+						timeoutMs: childTimeoutMs(),
+						attackerSessionDir: as.dir,
+						attackerSessionId: as.id,
+						builderSpawn: bs,
+					});
+					stage.status = concede ? "done" : "failed";
+					break;
+				}
+				case "INTEGRATE": {
+					const subtasksPath = path.join(dir, "subtasks.json");
+					let subtasksRaw: string;
+					try {
+						subtasksRaw = await fs.promises.readFile(subtasksPath, "utf-8");
+					} catch {
+						subtasksRaw = '{"subtasks":[]}';
+					}
+					let parsed: any;
+					try {
+						parsed = JSON.parse(subtasksRaw);
+					} catch {
+						parsed = { subtasks: [] };
+					}
+					const validation = validateManifest(parsed);
+					const entries = validation.ok ? validation.manifest.subtasks! : [];
+					const workerRuns: Array<{ entry: SubtaskEntry; run: AgentRun }> = entries.map((entry: SubtaskEntry) => {
+						const run = newRun("BUILDER", castModel("BUILDER"));
+						const workerFile = path.join(dir, `worker-${entry.id}.md`);
+						try {
+							const text = fs.readFileSync(workerFile, "utf-8");
+							run.text = text;
+							run.status = "done";
+						} catch {
+							run.status = "failed";
+							run.errorMessage = `Worker output not found: ${workerFile}`;
+						}
+						return { entry, run };
+					});
+					const as = roleSession("architect", ctx.cwd);
+					const { coordinator, fixupApplied } = await coordinatorIntegrate({
+						prompt,
+						coordinatorModel: castModel("COORDINATOR"),
+						workerRuns,
+						artifactsDir: dir,
+						signal: stopper.signal,
+						cwd: ctx.cwd,
+						timeoutMs: childTimeoutMs(),
+						sessionDir: as.dir,
+						sessionId: as.id,
+						noFixUp: false,
+					});
+					await gSave(dir, "integration-report.md", coordinator.text);
+					stage.status = runOk(coordinator) ? "done" : "failed";
+					break;
+				}
+			}
+		} catch (err) {
+			stage.status = "failed";
+			stage.artifacts["error"] = String(err);
+		}
+
+		stage.endedAt = new Date().toISOString();
+		stage.prompt = prompt;
+		stage.castSnapshot = { ...cast };
+		await saveCampaignState(dir, state);
+
+		// Goal: tiered board — full width if ≥100 cols, single line otherwise
+		try {
+			ctx.ui.setWidget(
+				CUSTOM_TYPE,
+				(_tui: any, theme: any) => {
+					const c = new Container();
+					const elapsed = fmtSecs(Date.now() - campaignStartedAt);
+					const totalCost = accumulateCost(state.stages);
+					c.addChild(
+						new Text(
+							theme.fg("customMessageLabel", theme.bold(`GAUNTLET · ${state.stages.length}-stage campaign`)) +
+								theme.fg("dim", ` · ${elapsed} · ~$${totalCost.toFixed(4)}`),
+							1,
+							0,
+						),
+					);
+					const stageLine = state.stages
+						.map((s, i) => {
+							const glyph = s.status === "done" ? "✓" : s.status === "failed" ? "✗" : s.status === "skipped" ? "⊘" : s.status === "working" ? "◐" : "○";
+							const color = s.status === "done" ? "success" : s.status === "failed" ? "error" : s.status === "working" ? "warning" : "dim";
+							return theme.fg(color, `${glyph} ${i + 1}. ${s.name}`);
+						})
+						.join(" · ");
+					c.addChild(new Text(theme.fg("muted", stageLine), 1, 0));
+					// Subtask checklist (after DECOMPOSE)
+					const subtasksPath = path.join(dir, "subtasks.json");
+					try {
+						const subtasksRaw = fs.readFileSync(subtasksPath, "utf-8");
+						const subParsed = JSON.parse(subtasksRaw);
+						const subV = validateManifest(subParsed);
+						if (subV.ok) {
+							for (const s of subV.manifest.subtasks!) {
+								const workerFile = path.join(dir, `worker-${s.id}.md`);
+								let exists = false;
+								try {
+									exists = fs.existsSync(workerFile);
+								} catch {}
+								c.addChild(new Text(`  ${exists ? "✓" : "○"} ${s.title ?? s.id}`, 1, 0));
+							}
+						}
+					} catch {}
+					return c;
+				},
+				{ placement: "aboveEditor" },
+			);
+		} catch {}
+
+		return stage.status === "done" || stage.status === "skipped";
+	}
+
+	// ═══ 8.21 /chain — compose arbitrary ordered stage chains ════════════════
+	const CHAIN_STAGE_NAMES = ["deliberate", "gate", "decompose", "build", "verify", "harden", "integrate"] as const;
+	type ChainStage = (typeof CHAIN_STAGE_NAMES)[number];
+	const CHAIN_STAGE_MAP: Record<ChainStage, GauntletStage> = {
+		deliberate: "deliberate",
+		gate: "gate",
+		decompose: "decompose",
+		build: "build",
+		verify: "verify",
+		harden: "harden",
+		integrate: "integrate",
+	};
+
+	/** Required input files for each stage (prerequisite map). */
+	const STAGE_PREREQS: Record<ChainStage, string[]> = {
+		deliberate: [],
+		gate: ["plan.md"],
+		decompose: ["plan.md"],
+		build: ["subtasks.json"],
+		verify: ["gate.py"],
+		harden: [],
+		integrate: ["plan.md"],
+	};
+
+	/** Union of roles required by the given set of stage names. */
+	const stageRoles = (stages: ChainStage[]): Role[] => {
+		const roles = new Set<Role>();
+		for (const s of stages) {
+			switch (s) {
+				case "deliberate":
+					roles.add("PANEL");
+					roles.add("CHAIRMAN");
+					roles.add("DEBATER_A");
+					roles.add("DEBATER_B");
+					roles.add("JUDGE");
+					break;
+				case "gate":
+				case "verify":
+					roles.add("VALIDATOR");
+					roles.add("BUILDER");
+					break;
+				case "decompose":
+				case "integrate":
+					roles.add("COORDINATOR");
+					break;
+				case "build":
+					roles.add("BUILDER");
+					break;
+				case "harden":
+					roles.add("ATTACKER");
+					roles.add("BUILDER");
+					break;
+			}
+		}
+		return [...roles];
+	};
+
+	pi.registerCommand("chain", {
+		description:
+			"Run any ordered subset of named pipeline stages over one artifacts dir. /chain <stages> <prompt> — e.g. /chain gate,build,verify <prompt> (or /chain deliberate,gate,decompose,build,verify,harden,integrate <prompt> for the full preset)",
+		handler: async (raw, ctx) => {
+			const input = (raw ?? "").trim();
+			if (!input) {
+				ctx.ui.notify("Usage: /chain <stages> <prompt> — e.g. /chain gate,build,verify <prompt>", "warning");
+				return;
+			}
+
+			// Split on first space to get <stages> and <prompt>
+			const spaceIdx = input.indexOf(" ");
+			if (spaceIdx < 0) {
+				ctx.ui.notify("Usage: /chain <stages> <prompt> — e.g. /chain gate,build,verify <prompt>", "warning");
+				return;
+			}
+			const stagesRaw = input.slice(0, spaceIdx).trim();
+			const prompt = input.slice(spaceIdx + 1).trim();
+
+			if (!prompt) {
+				ctx.ui.notify("Usage: /chain <stages> <prompt>", "warning");
+				return;
+			}
+
+			// Parse and validate stage names
+			const stageNames = stagesRaw.split(",").map((s) => s.trim().toLowerCase()) as ChainStage[];
+			const unknown = stageNames.filter((s) => !CHAIN_STAGE_NAMES.includes(s));
+			if (unknown.length > 0) {
+				ctx.ui.notify(
+					`chain: unknown stage name(s): ${unknown.join(", ")}. Accepted: ${CHAIN_STAGE_NAMES.join(", ")}`,
+					"error",
+				);
+				return;
+			}
+
+			// Prerequisite validation
+			const producedByChain = new Set<string>();
+			const missing: Array<{ stage: ChainStage; files: string[] }> = [];
+			const dir = await mkArtifacts();
+			try {
+				await fs.promises.rename(dir, path.join(path.dirname(dir), `chain-${path.basename(dir).replace("fusion-harness-", "")}`));
+			} catch {}
+			const realDir = fs.existsSync(path.join(path.dirname(dir), `chain-${path.basename(dir).replace("fusion-harness-", "")}`))
+				? path.join(path.dirname(dir), `chain-${path.basename(dir).replace("fusion-harness-", "")}`)
+				: dir;
+
+			for (const stage of stageNames) {
+				const prereqs = STAGE_PREREQS[stage];
+				const missingFiles = prereqs.filter((f) => !producedByChain.has(f) && !fs.existsSync(path.join(realDir, f)));
+				if (missingFiles.length > 0) {
+					missing.push({ stage, files: missingFiles });
+				}
+				// Register what this stage produces
+				switch (stage) {
+					case "deliberate":
+						producedByChain.add("plan.md");
+						break;
+					case "gate":
+						producedByChain.add("gate.py");
+						break;
+					case "decompose":
+						producedByChain.add("subtasks.json");
+						break;
+					case "build":
+						break;
+					case "verify":
+						break;
+					case "harden":
+						break;
+					case "integrate":
+						break;
+				}
+			}
+
+			if (missing.length > 0) {
+				const msg = missing
+					.map((m) => `  ${m.stage}: ${m.files.join(", ")}`)
+					.join("\n");
+				ctx.ui.notify(`chain: missing prerequisites — no spawn occurred\n${msg}`, "error");
+				return;
+			}
+
+			// Resolve cast roles
+			seedCast(ctx.cwd);
+			const roles = stageRoles(stageNames);
+			if (!(await runCastGate(ctx, "chain", false))) return;
+			if (!(await preflightOrFail(roles, ctx, "chain"))) return;
+
+			// Build campaign state
+			const stageStates: StageState[] = stageNames.map((n) => emptyStage(GAUNTLET_STAGE_NAMES[CHAIN_STAGE_MAP[n]]));
+			const campaignState: CampaignState = {
+				prompt,
+				stages: stageStates,
+				cast: { ...cast },
+				createdAt: new Date().toISOString(),
+				skipCouncil: false,
+				skipRedteam: true,
+				deliberateMode: "council",
+			};
+
+			await gSave(realDir, "state.json", JSON.stringify(campaignState, null, 2));
+
+			panel({ kind: "prompt", command: "chain", ok: true }, `/chain ${stagesRaw} ${prompt}`);
+			panel(
+				{ kind: "banner", command: "chain", ok: true, prompt, artifactsDir: realDir },
+				`Chain: ${stageNames.join(" → ")} · artifacts: ${realDir}`,
+			);
+
+			const campaignStartedAt = Date.now();
+			const stopper = startStoppable(ctx, "chain");
+
+			try {
+				for (let i = 0; i < campaignState.stages.length; i++) {
+					if (stopper.stopped()) break;
+					const cont = await runGauntletStage(i, campaignState, realDir, prompt, ctx, stopper, campaignStartedAt);
+					if (!cont) break;
+				}
+
+				const completed = campaignState.stages.filter((s) => s.status === "done" || s.status === "skipped").length;
+				if (completed === campaignState.stages.length) {
+					panel(
+						{
+							kind: "verdict",
+							command: "chain",
+							ok: true,
+							artifactsDir: realDir,
+							totalMs: Date.now() - campaignStartedAt,
+							totalCostUsd: accumulateCost(campaignState.stages),
+						},
+						[
+							`## Chain Complete`,
+							``,
+							`Stages: ${stageNames.join(" → ")}`,
+							`Artifacts: ${realDir}`,
+						].join("\n"),
+					);
+				} else {
+					const failed = campaignState.stages.filter((s) => s.status === "failed").map((s) => s.name);
+					panel(
+						{
+							kind: "error",
+							command: "chain",
+							ok: false,
+							artifactsDir: realDir,
+							totalMs: Date.now() - campaignStartedAt,
+							totalCostUsd: accumulateCost(campaignState.stages),
+						},
+						[
+							`## Chain Halted`,
+							``,
+							`**Completed:** ${completed}/${campaignState.stages.length} stages`,
+							failed.length ? `**Failed:** ${failed.join(", ")}` : `**Stopped:** escape`,
+							`Artifacts: ${realDir}`,
+						].join("\n"),
+					);
+				}
+			} finally {
+				stopper.release();
+				try {
+					ctx.ui.setWidget(CUSTOM_TYPE, undefined);
+				} catch {}
+				ctx.ui.setStatus(CUSTOM_TYPE, undefined);
+			}
+		},
+	});
+
+	pi.registerCommand("gauntlet", {
+
+		description:
+			"Full campaign pipeline: deliberate → gate → decompose → build → verify → harden → integrate. /gauntlet <prompt> [--skip-council] [--skip-redteam] [--deliberate=council|debate] [--resume [dir]]",
+		handler: async (raw, ctx) => {
+			let input = (raw ?? "").trim();
+			let skipCouncil = false;
+			let skipRedteam = false;
+			let deliberateMode: "council" | "debate" = "council";
+			let resumeDir: string | undefined;
+			let resumeExplicit = false;
+
+			// Parse flags
+			input = input
+				.replace(/\s*--skip-council\s*/g, () => {
+					skipCouncil = true;
+					return " ";
+				})
+				.replace(/\s*--skip-redteam\s*/g, () => {
+					skipRedteam = true;
+					return " ";
+				})
+				.replace(/--deliberate[=\s]+(\S+)\s*/g, (_m: string, mode: string) => {
+					deliberateMode = mode === "debate" ? "debate" : "council";
+					return " ";
+				})
+				.replace(/--resume(?:\s+(\S+))?\s*/g, (_m: string, dir?: string) => {
+					resumeDir = dir || undefined;
+					resumeExplicit = true;
+					return " ";
+				})
+				.trim();
+
+			// Handle resume
+			if (resumeExplicit) {
+				seedCast(ctx.cwd);
+				const targetDir = resumeDir || (await latestGauntletDir());
+				if (!targetDir) {
+					ctx.ui.notify("gauntlet: --resume specified but no gauntlet-* dir found in /tmp", "error");
+					return;
+				}
+				let state: CampaignState;
+				try {
+					state = await loadCampaignState(targetDir);
+				} catch {
+					ctx.ui.notify(`gauntlet: --resume target ${targetDir} has no valid state.json`, "error");
+					return;
+				}
+				const startIdx = firstIncompleteStage(state);
+				if (startIdx < 0 || startIdx >= state.stages.length) {
+					ctx.ui.notify(`gauntlet: campaign at ${targetDir} is already complete (${state.stages.filter((s) => s.status === "done").length}/${state.stages.length} stages)`, "info");
+					return;
+				}
+				// Pre-fill cast from stored state
+				if (state.cast) Object.assign(cast, state.cast);
+
+				// Interactive cast sheet (with stored cast shown)
+				if (!(await runCastGate(ctx, "gauntlet", false))) return;
+				if (!(await preflightOrFail(COMMAND_CAST["gauntlet"] ?? [], ctx, "gauntlet"))) return;
+
+				const prompt = state.prompt;
+				const campaignStartedAt = Date.now();
+				ctx.ui.setStatus(CUSTOM_TYPE, `gauntlet: resuming at stage ${startIdx + 1}/${state.stages.length}…`);
+				panel({ kind: "banner", command: "gauntlet", ok: true, prompt, roles: [{ role: "ARCHITECT", model: architectModel() }, { role: "BUILDER", model: builderModel() }], artifactsDir: targetDir }, "resuming…");
+
+				const stopper = startStoppable(ctx, "gauntlet");
+				try {
+					for (let i = startIdx; i < state.stages.length; i++) {
+						if (stopper.stopped()) break;
+						if (state.stages[i]!.status === "done") continue;
+						const cont = await runGauntletStage(i, state, targetDir, prompt, ctx, stopper, campaignStartedAt);
+						if (!cont) break;
+					}
+				} finally {
+					stopper.release();
+					ctx.ui.setStatus(CUSTOM_TYPE, undefined);
+					try {
+						ctx.ui.setWidget(CUSTOM_TYPE, undefined);
+					} catch {}
+				}
+
+				const completed = state.stages.filter((s) => s.status === "done" || s.status === "skipped").length;
+				if (completed === state.stages.length) {
+					panel({ kind: "verdict", command: "gauntlet", ok: true, artifactsDir: targetDir, totalMs: Date.now() - campaignStartedAt, totalCostUsd: accumulateCost(state.stages) }, `## Campaign Complete\n\nAll ${state.stages.length} stages completed successfully.\n\nArtifacts: ${targetDir}`);
+				} else {
+					const failed = state.stages.filter((s) => s.status === "failed").map((s) => s.name);
+					panel({ kind: "error", command: "gauntlet", ok: false, artifactsDir: targetDir, totalMs: Date.now() - campaignStartedAt, totalCostUsd: accumulateCost(state.stages) }, `## Campaign Halted\n\n**Completed:** ${completed}/${state.stages.length} stages\n${failed.length ? `**Failed:** ${failed.join(", ")}` : "**Stopped:** escape pressed"}\n\nArtifacts: ${targetDir}`);
+				}
+				return;
+			}
+
+			// Fresh campaign
+			const prompt = input;
+			if (!prompt) {
+				ctx.ui.notify("Usage: /gauntlet <prompt> [--skip-council] [--skip-redteam] [--deliberate=council|debate] [--resume [dir]]", "warning");
+				return;
+			}
+
+			seedCast(ctx.cwd);
+			if (!(await runCastGate(ctx, "gauntlet", false))) return;
+			if (!(await preflightOrFail(COMMAND_CAST["gauntlet"] ?? [], ctx, "gauntlet"))) return;
+
+			const dir = await mkArtifacts();
+			const gauntletDir = path.join(path.dirname(dir), `gauntlet-${path.basename(dir).replace("fusion-harness-", "")}`);
+			try {
+				await fs.promises.rename(dir, gauntletDir);
+			} catch {}
+			const realDir = fs.existsSync(gauntletDir) ? gauntletDir : dir;
+
+			const stageNames: GauntletStage[] = [...GAUNTLET_STAGES];
+
+			const campaignState: CampaignState = {
+				prompt,
+				stages: stageNames.map((n) => emptyStage(GAUNTLET_STAGE_NAMES[n])),
+				cast: { ...cast },
+				createdAt: new Date().toISOString(),
+				skipCouncil,
+				skipRedteam,
+				deliberateMode,
+			};
+
+			await saveCampaignState(realDir, campaignState);
+
+			panel({ kind: "prompt", command: "gauntlet", ok: true }, `/gauntlet ${(raw ?? "").trim()}`);
+			panel(
+				{
+					kind: "banner",
+					command: "gauntlet",
+					ok: true,
+					prompt,
+					roles: [
+						{ role: "ARCHITECT", model: architectModel() },
+						{ role: "BUILDER", model: builderModel() },
+					],
+					artifactsDir: realDir,
+				},
+				`${stageNames.length}-stage campaign running in ${realDir}`,
+			);
+
+			const campaignStartedAt = Date.now();
+			const stopper = startStoppable(ctx, "gauntlet");
+
+			try {
+				for (let i = 0; i < campaignState.stages.length; i++) {
+					if (stopper.stopped()) break;
+					const cont = await runGauntletStage(i, campaignState, realDir, prompt, ctx, stopper, campaignStartedAt);
+					if (!cont) break;
+				}
+
+				const completed = campaignState.stages.filter((s) => s.status === "done" || s.status === "skipped").length;
+				if (completed === campaignState.stages.length) {
+					panel(
+						{
+							kind: "verdict",
+							command: "gauntlet",
+							ok: true,
+							artifactsDir: realDir,
+							totalMs: Date.now() - campaignStartedAt,
+							totalCostUsd: accumulateCost(campaignState.stages),
+						},
+						[
+							`## Campaign Complete`,
+							``,
+							`All ${campaignState.stages.length} stages completed.`,
+							``,
+							`**Artifacts:** ${realDir}`,
+							``,
+							...campaignState.stages.map((s, i) => {
+								const artList = Object.entries(s.artifacts).map(([k, v]) => `  • ${k}: ${v}`).join("\n");
+								return `### ${i + 1}. ${s.name} — ${s.status}${artList ? `\n${artList}` : ""}`;
+							}),
+						].join("\n"),
+					);
+				} else {
+					const failed = campaignState.stages.filter((s) => s.status === "failed").map((s) => s.name);
+					panel(
+						{
+							kind: "error",
+							command: "gauntlet",
+							ok: false,
+							artifactsDir: realDir,
+							totalMs: Date.now() - campaignStartedAt,
+							totalCostUsd: accumulateCost(campaignState.stages),
+						},
+						[
+							`## Campaign Halted`,
+							``,
+							`**Completed:** ${completed}/${campaignState.stages.length} stages`,
+							failed.length ? `**Failed:** ${failed.join(", ")}` : `**Stopped:** escape pressed`,
+							``,
+							`**Artifacts:** ${realDir}`,
+							``,
+							`To resume: \`/gauntlet --resume\``,
+						].join("\n"),
+					);
+				}
+			} finally {
+				stopper.release();
+				try {
+					ctx.ui.setWidget(CUSTOM_TYPE, undefined);
+				} catch {}
 				ctx.ui.setStatus(CUSTOM_TYPE, undefined);
 			}
 		},
