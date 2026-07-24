@@ -66,8 +66,8 @@ import { randomUUID } from "node:crypto"; // persistent per-role session ids
 import * as fs from "node:fs"; // prompt files, artifacts, session manifests
 import * as os from "node:os"; // tmpdir fallback when /tmp is missing
 import * as path from "node:path"; // every artifact/session path
-import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Markdown, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type ExtensionAPI, getMarkdownTheme, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { Box, Container, Markdown, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, Input, matchesKey, fuzzyFilter, type Component, type Focusable, type TUI } from "@earendil-works/pi-tui";
 
 // ═══ 1. Defaults ═════════════════════════════════════════════════════════════
 
@@ -100,9 +100,86 @@ const DETAIL_SNIPPET_MAX = 4_000; // chars of script/output kept in message deta
 
 const CUSTOM_TYPE = "fusion-harness"; // customType tag on every panel/widget/status this extension emits
 
+// ═══ 1b. Multi-provider cast types and constants ═══════════════════════════
+
+/** A cast member: the model string and an optional thinking override. */
+interface CastMember { model: string; thinking?: string; }
+/** The full cast map: role name → CastMember. */
+type Cast = Record<string, CastMember>;
+/** The two sides of the harness — every role belongs to one. */
+type Side = "architect" | "builder";
+/** Thinking levels supported by pi and the harness. */
+type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** The project cast file name (written by SAVE, read at boot). */
+const CAST_FILE = ".fusion-harness.json";
+
+/** Every known role in the system. Used for /roles and the cast sheet. */
+const KNOWN_ROLES: readonly string[] = [
+	"ARCHITECT", "BUILDER", "FUSION", "VALIDATOR",
+	"DEBATER_A", "DEBATER_B", "JUDGE",
+	"COORDINATOR",
+	"PANEL", "CHAIRMAN",
+	"ATTACKER",
+];
+
+/** Which side a role belongs to — every role inherits its side's default model. */
+const ROLE_SIDE: Record<string, Side> = {
+	ARCHITECT: "architect",
+	BUILDER: "builder",
+	FUSION: "architect",
+	VALIDATOR: "architect",
+	DEBATER_A: "architect",
+	DEBATER_B: "builder",
+	JUDGE: "architect",
+	COORDINATOR: "architect",
+	PANEL: "architect",
+	CHAIRMAN: "architect",
+	ATTACKER: "architect",
+};
+
+/** The primary role for each side (the one whose default model the side inherits from). */
+const SIDE_PRIMARY: Record<Side, string> = {
+	architect: "ARCHITECT",
+	builder: "BUILDER",
+};
+
+/** The canonical cycle of thinking levels for the `t` key in the cast sheet (inherit first). */
+const THINKING_CYCLE = ["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** Alias map: lowercase short forms → canonical Thinking level. */
+const THINKING_ALIAS: Record<string, Thinking> = {
+	off: "off",
+	none: "off",
+	minimal: "minimal",
+	min: "minimal",
+	low: "low",
+	medium: "medium",
+	med: "medium",
+	mid: "medium",
+	high: "high",
+	hi: "high",
+	xhigh: "xhigh",
+	xhi: "xhigh",
+	max: "max",
+};
+
+/** Human-readable thinking level help string for CLI usage messages. */
+const THINKING_HELP = "off|minimal|low|medium|high|xhigh|max";
+
+/** Resolve a thinking-level string (flag value, alias, or canonical) to a canonical level, or undefined on mismatch. */
+function resolveThinking(s: string): Thinking | undefined {
+	return THINKING_ALIAS[s.trim().toLowerCase()];
+}
+
+/** True when `role` is one of the known role strings. Used by the cast system to validate project cast file entries. */
+function isKnownRole(role: string): boolean {
+	return KNOWN_ROLES.includes(role);
+}
+
 // ═══ 2. Roles ════════════════════════════════════════════════════════════════
 
-type Role = "ARCHITECT" | "BUILDER" | "FUSION" | "VALIDATOR";
+type Role = "ARCHITECT" | "BUILDER" | "FUSION" | "VALIDATOR" | "DEBATER_A" | "DEBATER_B" | "JUDGE" | "COORDINATOR" | "PANEL" | "CHAIRMAN" | "ATTACKER";
 
 /** One consistent color per role, everywhere (columns, footer, panels, errors). */
 const ROLE_COLOR: Record<Role, "accent" | "warning" | "success" | "mdLink"> = {
@@ -110,6 +187,13 @@ const ROLE_COLOR: Record<Role, "accent" | "warning" | "success" | "mdLink"> = {
 	BUILDER: "warning",
 	FUSION: "success",
 	VALIDATOR: "mdLink",
+	DEBATER_A: "accent",
+	DEBATER_B: "warning",
+	JUDGE: "success",
+	COORDINATOR: "accent",
+	PANEL: "mdLink",
+	CHAIRMAN: "success",
+	ATTACKER: "warning",
 };
 
 /** One consistent glyph per role, paired with the color above. */
@@ -118,6 +202,13 @@ const ROLE_GLYPH: Record<Role, string> = {
 	BUILDER: "▲",
 	FUSION: "⧉",
 	VALIDATOR: "✓",
+	DEBATER_A: "◀",
+	DEBATER_B: "▶",
+	JUDGE: "⚖",
+	COORDINATOR: "◎",
+	PANEL: "☰",
+	CHAIRMAN: "★",
+	ATTACKER: "✕",
 };
 
 // ═══ 3. Types ════════════════════════════════════════════════════════════════
@@ -170,8 +261,8 @@ interface AgentStat {
 
 /** The renderer's discriminated payload — one shape per panel `kind`, carried on every custom message. */
 interface FhDetails {
-	kind: "prompt" | "banner" | "duo" | "fused" | "opinion" | "gate" | "validation" | "triage" | "error" | "system-prompt" | "boot" | "preflight";
-	command?: "fusion" | "auto-validate" | "opinion" | "system-prompt"; // absent on "boot" — it belongs to no command
+	kind: "prompt" | "banner" | "duo" | "fused" | "opinion" | "gate" | "validation" | "triage" | "error" | "system-prompt" | "boot" | "debate" | "coord" | "council" | "redteam" | "verdict" | "multi";
+	command?: "fusion" | "auto-validate" | "opinion" | "system-prompt" | "parallel" | "debate" | "coordinate" | "council" | "redteam"; // absent on "boot" — it belongs to no command
 	ok: boolean;
 	round?: number; // auto-validate: which build→validate round this panel reports
 	maxRounds?: number; // auto-validate: the --max-validations cap
@@ -362,6 +453,51 @@ const thinkingTag = (level?: string): string => (level ? ` (${THINKING_SHORT[lev
  * Returns the first match of `/^<prefix>:\s*(\S+)\s*—/` scanning from the bottom.
  * The matched value is returned (e.g. "BREACH", "CONCEDE"). Returns undefined when no line matches.
  */
+function parseStrictVerdictLine(text: string, prefix: string): string | undefined {
+	const lines = text.trim().split("\n");
+	const pat = new RegExp(`^${prefix}:\\s*(\\S+)\\s*—`);
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const m = lines[i]!.trim().match(pat);
+		if (m) return m[1]!;
+	}
+	return undefined;
+}
+
+/** Spawn config for a fresh ephemeral session: throwaway session dir inside the run's artifacts dir. */
+const ephemeralSpawn = (artifactsDir: string, label: string): { sessionDir: string } => ({
+	sessionDir: path.join(artifactsDir, label),
+});
+
+/**
+ * Compact one-line-per-run display for the live widget when more than two runs are active:
+ * `glyph ROLE shortModel · status · last activity · tokens`
+ */
+function compactRunLine(theme: any, r: AgentRun): string {
+	const now = Date.now();
+	const elapsed = r.startedAt ? (r.endedAt ?? now) - r.startedAt : 0;
+	const state =
+		r.status === "pending" ? "waiting" :
+		r.status === "working" ? `${Math.floor(elapsed / 1000)}s` :
+		r.status === "done" ? `done ${fmtSecs(elapsed)}` :
+		`${r.status}`;
+	const stateColor = r.status === "done" ? "success" : r.status === "working" ? ROLE_COLOR[r.role] : r.status === "pending" ? "dim" : "error";
+	const lastFlow = r.flow.length > 0 ? r.flow[r.flow.length - 1] : undefined;
+	let activity = "";
+	if (r.streamThinking) activity = "thinking…";
+	else if (r.streamText) activity = "answering…";
+	else if (lastFlow?.type === "tool") activity = lastFlow.label;
+	else if (lastFlow?.type === "thinking") activity = "thought";
+	else if (lastFlow?.type === "text") activity = "answered";
+	const tokens = r.tokensIn || r.tokensOut ? `in ${fmtK(r.tokensIn)} out ${fmtK(r.tokensOut)}` : "";
+	const bits = [
+		theme.fg(ROLE_COLOR[r.role], `${ROLE_GLYPH[r.role]} ${r.role}`),
+		theme.fg("dim", shortModel(r.model)),
+		theme.fg(stateColor, state),
+	];
+	if (activity) bits.push(theme.fg("muted", activity));
+	if (tokens) bits.push(theme.fg("dim", tokens));
+	return bits.join(" · ");
+}
 
 // ═══ 5. Two-column layout ════════════════════════════════════════════════════
 
@@ -1976,6 +2112,56 @@ export default function (pi: ExtensionAPI) {
 				md(content);
 				break;
 			}
+			case "multi": {
+				const kindLabel: Record<string, string> = {
+					parallel: "PARALLEL — both results",
+					council: "COUNCIL — panel answers",
+					coordinate: "COORDINATE — subtask results",
+					redteam: "REDTEAM — sortie report",
+				};
+				const title = kindLabel[d.command ?? ""] || `/${d.command} — results`;
+				add(new Text(theme.fg("customMessageLabel", theme.bold(`FUSION HARNESS · ${title}`)), 1, 0));
+				blank();
+				const agents = d.sources ?? [];
+				const answerList = d.answers ?? [];
+				if (agents.length <= 2) {
+					const col = (a: AgentStat | undefined, body: string, colW: number): string[] =>
+						a ? [roleLabelStr(theme, a.role, a.model), theme.fg(a.error ? "error" : "dim", `${STATUS_GLYPH[a.status]} ${statLine(a)}`), "", ...(a.error ? [theme.fg("error", theme.bold(`✗ FAILED — ${a.error}`))] : []), ...mdLines(body, colW)] : [];
+					add(new TwoCol((w) => ({
+						left: col(agents[0], answerList[0]?.text ?? "", w),
+						right: agents[1] ? col(agents[1], answerList[1]?.text ?? "", w) : [],
+					}), theme.fg("dim", " │ ")));
+				} else {
+					for (let i = 0; i < agents.length; i++) {
+						const a = agents[i];
+						const ans = answerList[i];
+						if (i > 0) blank();
+						if (a) {
+							add(new Text(roleLabelStr(theme, a.role, a.model), 1, 0));
+							add(new Text(theme.fg(a.error ? "error" : "dim", `${STATUS_GLYPH[a.status]} ${statLine(a)}`), 1, 0));
+							if (a.error) add(new Text(theme.fg("error", theme.bold(`✗ FAILED — ${a.error}`)), 1, 0));
+						}
+						if (ans?.text) { blank(); add(new Markdown(ans.text, 1, 0, getMarkdownTheme())); }
+					}
+				}
+				break;
+			}
+			case "verdict": {
+				add(new Text(theme.fg("customMessageLabel", theme.bold(`FUSION HARNESS · /${d.command ?? "?"} — VERDICT`)) + (d.agent ? theme.fg("dim", `   ${STATUS_GLYPH[d.agent.status]} ${statLine(d.agent)}`) : ""), 1, 0));
+				if (d.agent) add(new Text(`  ${roleLabelStr(theme, d.agent.role, d.agent.model)}`, 1, 0));
+				blank();
+				md(content);
+				break;
+			}
+			case "council":
+			case "debate":
+			case "coord":
+			case "redteam": {
+				add(new Text(theme.fg("customMessageLabel", theme.bold(`FUSION HARNESS · /${d.command ?? "?"}`)) + (d.ok ? "" : theme.fg("error", theme.bold(" — ISSUES FOUND"))), 1, 0));
+				blank();
+				md(content);
+				break;
+			}
 			default: {
 				// "error" and anything else: attributed failure, loud and specific.
 				add(new Text(theme.fg("error", theme.bold(`✗ FUSION HARNESS · /${d.command ?? "?"} FAILED`)), 1, 0));
@@ -2048,18 +2234,18 @@ export default function (pi: ExtensionAPI) {
 	const startWidget = (
 		ctx: any,
 		command: string,
-		cols: [AgentRun, AgentRun],
+		runs: AgentRun[],
 		span: AgentRun | undefined,
 		startedAt: number,
 	) => {
-		liveRuns = span ? [...cols, span] : [...cols];
+		liveRuns = span ? [...runs, span] : [...runs];
 		const render = () => {
 			try {
 				ctx.ui.setWidget(
 					CUSTOM_TYPE,
 					(_tui: any, theme: any) => {
 						const c = new Container();
-						const all = span ? [...cols, span] : [...cols];
+						const all = span ? [...runs, span] : [...runs];
 						const cost = all.reduce((s, r) => s + r.costUsd, 0);
 						c.addChild(
 							new Text(
@@ -2069,13 +2255,19 @@ export default function (pi: ExtensionAPI) {
 								0,
 							),
 						);
-						c.addChild(new TwoCol((colW) => ({
-							left: liveColumn(theme, cols[0], colW),
-							right: cols[1] ? liveColumn(theme, cols[1], colW) : [],
-						}), theme.fg("dim", " │ ")));
-						if (span && span.status !== "pending") {
-							c.addChild(new Text("", 0, 0));
-							c.addChild(new FullWidth((w) => liveColumn(theme, span, w)));
+						if (runs.length <= 2) {
+							c.addChild(new TwoCol((colW) => ({
+								left: liveColumn(theme, runs[0], colW),
+								right: runs[1] ? liveColumn(theme, runs[1], colW) : [],
+							}), theme.fg("dim", " │ ")));
+							if (span && span.status !== "pending") {
+								c.addChild(new Text("", 0, 0));
+								c.addChild(new FullWidth((w) => liveColumn(theme, span, w)));
+							}
+						} else {
+							for (const r of all) {
+								c.addChild(new Text(compactRunLine(theme, r), 1, 0));
+							}
 						}
 						return c;
 					},
@@ -2089,7 +2281,7 @@ export default function (pi: ExtensionAPI) {
 		const ticker = setInterval(render, WIDGET_TICK_MS);
 		return () => {
 			clearInterval(ticker);
-			const all = span ? [...cols, span] : [...cols];
+			const all = span ? [...runs, span] : [...runs];
 			absorbTotals(all);
 			liveRuns = [];
 			try {
@@ -2288,6 +2480,11 @@ export default function (pi: ExtensionAPI) {
 		fusion: ["ARCHITECT", "BUILDER", "FUSION"],
 		"auto-validate": ["VALIDATOR", "BUILDER"],
 		opinion: ["ARCHITECT", "BUILDER"],
+		parallel: ["ARCHITECT", "BUILDER"],
+		debate: ["DEBATER_A", "DEBATER_B", "JUDGE"],
+		coordinate: ["COORDINATOR"],
+		council: ["PANEL", "CHAIRMAN"],
+		redteam: ["ATTACKER", "BUILDER"],
 	};
 	const runCastGate = async (ctx: any, command: string, skip: boolean): Promise<boolean> => {
 		const roles = COMMAND_CAST[command] ?? KNOWN_ROLES;
@@ -2437,11 +2634,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fusion", {
 		description: 'ARCHITECT + BUILDER answer in parallel (two live columns), then a fusion agent merges them — /fusion "prompt" "fusion-prompt" (or `prompt :: fusion-prompt`)',
 		handler: async (raw, ctx) => {
-			const input = (raw ?? "").trim();
+			const { rest, skip } = stripCastDefaults(raw ?? "");
+			const input = (rest ?? "").trim();
 			if (!input) {
-				ctx.ui.notify('Usage: /fusion "<prompt>" "<fusion-prompt>"  (or: /fusion <prompt> :: <fusion-prompt>)', "warning");
+				ctx.ui.notify('Usage: /fusion "<prompt>" "<fusion-prompt>"  (or: /fusion <prompt> :: <fusion-prompt>  or: /fusion --cast-defaults ...)', "warning");
 				return;
 			}
+			if (!(await runCastGate(ctx, "fusion", skip))) return;
 			const parsed = parseFusionArgs(input);
 			const prompt = parsed.prompt;
 			const fusionInstruction = parsed.fusion || defaultFusionPrompt();
@@ -2640,7 +2839,8 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Auto-validation loop: VALIDATOR designs a uv acceptance gate FIRST, BUILDER builds, the gate runs, failures feed back to the builder — until pass or --max-validations (default 5)",
 		handler: async (raw, ctx) => {
-			let input = (raw ?? "").trim();
+			const { rest, skip } = stripCastDefaults(raw ?? "");
+			let input = (rest ?? "").trim();
 			// Inline overrides of the startup flags: /auto-validate --max-validations 3 --escalate-to-validator-count 2 <prompt>
 			let maxV = clampValidations(Number.parseInt(flagStr("max-validations"), 10));
 			let escalateAt = clampCount(Number.parseInt(flagStr("escalate-to-validator-count"), 10), ESCALATE_DEFAULT);
@@ -2655,9 +2855,10 @@ export default function (pi: ExtensionAPI) {
 				})
 				.trim();
 			if (!input) {
-				ctx.ui.notify("Usage: /auto-validate [--max-validations N] [--escalate-to-validator-count N] <prompt>", "warning");
+				ctx.ui.notify("Usage: /auto-validate [--max-validations N] [--escalate-to-validator-count N] <prompt>  (or /auto-validate --cast-defaults ...)", "warning");
 				return;
 			}
+			if (!(await runCastGate(ctx, "auto-validate", skip))) return;
 			const prompt = input;
 			const aModel = architectModel();
 			const bModel = builderModel();
@@ -3086,11 +3287,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("opinion", {
 		description: "Both models answer independently — side-by-side two-column panel (model · latency · tokens · cost). No fusion.",
 		handler: async (raw, ctx) => {
-			const prompt = (raw ?? "").trim();
+			const { rest, skip } = stripCastDefaults(raw ?? "");
+			const prompt = (rest ?? "").trim();
 			if (!prompt) {
-				ctx.ui.notify("Usage: /opinion <prompt>", "warning");
+				ctx.ui.notify("Usage: /opinion <prompt>  (or /opinion --cast-defaults <prompt>)", "warning");
 				return;
 			}
+			if (!(await runCastGate(ctx, "opinion", skip))) return;
 			const aModel = architectModel();
 			const bModel = builderModel();
 			const startedAt = Date.now();
