@@ -2489,7 +2489,7 @@ export default function (pi: ExtensionAPI) {
 			.replace(/[^a-zA-Z0-9]+/g, "-")
 			.replace(/^-+|-+$/g, "")
 			.slice(-60) || "root";
-	const sessionsRootFor = (cwd: string): string => path.join(ARTIFACT_ROOT, "fusion-harness-sessions", projectSlug(cwd));
+	const sessionsRootFor = (cwd: string): string => path.join(ARTIFACT_ROOT_G, "fusion-harness-sessions", projectSlug(cwd));
 	// Keyed per role AND model: a transcript built under one model must never be replayed
 	// as another model's own history. Observed live: a sonnet-5-built architect session
 	// (full of "You are the ARCHITECT agent (anthropic/claude-sonnet-5)" turns) replayed
