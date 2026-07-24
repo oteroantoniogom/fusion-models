@@ -170,7 +170,7 @@ interface AgentStat {
 
 /** The renderer's discriminated payload — one shape per panel `kind`, carried on every custom message. */
 interface FhDetails {
-	kind: "prompt" | "banner" | "duo" | "fused" | "opinion" | "gate" | "validation" | "triage" | "error" | "system-prompt" | "boot";
+	kind: "prompt" | "banner" | "duo" | "fused" | "opinion" | "gate" | "validation" | "triage" | "error" | "system-prompt" | "boot" | "preflight";
 	command?: "fusion" | "auto-validate" | "opinion" | "system-prompt"; // absent on "boot" — it belongs to no command
 	ok: boolean;
 	round?: number; // auto-validate: which build→validate round this panel reports
@@ -189,6 +189,9 @@ interface FhDetails {
 	artifactsDir?: string;
 	totalMs?: number;
 	totalCostUsd?: number;
+	// preflight: every cast member that failed resolution/auth, plus any catalog-refresh error.
+	preflightFailures?: Array<{ role: Role; model: string; kind: "unresolved" | "no-auth"; provider: string; id: string }>;
+	catalogError?: string;
 	error?: string;
 }
 
@@ -351,6 +354,14 @@ const THINKING_SHORT: Record<string, string> = {
 };
 /** ` (med)` — the parenthesized short thinking level appended to a model label. */
 const thinkingTag = (level?: string): string => (level ? ` (${THINKING_SHORT[level] ?? level})` : "");
+
+// ═══ 4b. Verdict-line parser (shared by redteam, debate, future loop commands) ═══
+
+/**
+ * Parse a strict prefix-anchored final line from the last non-empty lines of agent text.
+ * Returns the first match of `/^<prefix>:\s*(\S+)\s*—/` scanning from the bottom.
+ * The matched value is returned (e.g. "BREACH", "CONCEDE"). Returns undefined when no line matches.
+ */
 
 // ═══ 5. Two-column layout ════════════════════════════════════════════════════
 
@@ -923,6 +934,416 @@ function extractGateScript(text: string): string | undefined {
 	return ensureGateMetadata(script);
 }
 
+// ═══ 7b. Cast sheet overlay component (role-casting capability) ═════════════
+// A self-contained @earendil-works/pi-tui Component rendered via ctx.ui.custom(…, {overlay:true}).
+// One row per declared role (role · model · thinking · auth), keyboard navigation, a
+// provider→model drill-down with type-to-filter fuzzy search (authenticated first), a
+// manual provider/id entry (Focusable Input), `t` cycling a row's thinking level, plus
+// SAVE / RUN / Esc actions. Natively supports multi-pick rows for panel roles.
+
+interface CastSheetInit {
+	tui: TUI;
+	roles: Role[]; // the rows to show (a command's declared cast, or all known for /roles)
+	working: Cast; // working copy — committed to the live cast only on RUN/SAVE
+	modelRegistry: any; // ctx.modelRegistry: getAll/find/hasConfiguredAuth/getProviderDisplayName
+	cwd: string;
+	command?: string;
+	multiPick: Role[]; // roles that pick several models (PANEL) — toggle instead of replace
+	onCommit: (next: Cast) => void; // apply working → session cast
+	onSave: (next: Cast) => string; // write working → <cwd>/.fusion-harness.json, return path
+	done: (result: "run" | "cancel") => void;
+}
+
+type SheetMode = "rows" | "drill" | "manual";
+
+/** One selectable model in a drill-down list. */
+interface DrillItem {
+	model: string; // provider/id
+	provider: string;
+	id: string;
+	name: string;
+	authed: boolean;
+	selected: boolean; // multi-pick membership
+}
+
+class CastSheet implements Component {
+	focused = false; // Focusable: the manual Input is focused only in manual mode
+	private tui: TUI;
+	private roles: Role[];
+	private working: Cast;
+	private reg: any;
+	private cwd: string;
+	private command?: string;
+	private multiPick: Role[];
+	private onCommit: (next: Cast) => void;
+	private onSave: (next: Cast) => string;
+	private done: (result: "run" | "cancel") => void;
+
+	private mode: SheetMode = "rows";
+	private cursor = 0; // rows mode: index across [roleRows…, SAVE, RUN]
+	private drillRole: Role = "ARCHITECT";
+	private drillIndex = 0;
+	private drillScroll = 0;
+	private filter = "";
+	private items: DrillItem[] = [];
+	private manualInput = new Input();
+	private savedMsg = "";
+	private settled = false; // guard: done() called exactly once
+	private maxListRows = 14;
+
+	constructor(init: CastSheetInit) {
+		this.tui = init.tui;
+		this.roles = init.roles;
+		this.working = init.working;
+		this.reg = init.modelRegistry;
+		this.cwd = init.cwd;
+		this.command = init.command;
+		this.multiPick = init.multiPick;
+		this.onCommit = init.onCommit;
+		this.onSave = init.onSave;
+		this.done = init.done;
+	}
+
+	/** The current model a row shows (its working entry, else inherited default). */
+	private roleModel(role: Role): string {
+		return this.working[role]?.model ?? this.inheritedModel(role);
+	}
+	private inheritedModel(role: Role): string {
+		const primary = SIDE_PRIMARY[ROLE_SIDE[role]];
+		return primary === role ? (ROLE_SIDE[role] === "architect" ? DEFAULT_ARCHITECT : DEFAULT_BUILDER) : this.roleModel(primary);
+	}
+	private roleThinkingDisplay(role: Role): string {
+		return this.working[role]?.thinking ?? "inherit";
+	}
+
+	/** Enter the drill-down for a role: build + sort + filter the model list. */
+	private enterDrill(role: Role) {
+		this.drillRole = role;
+		this.mode = "drill";
+		this.filter = "";
+		this.drillIndex = 0;
+		this.drillScroll = 0;
+		this.rebuildItems();
+		this.rerender();
+	}
+	/** Build the full item list from the registry, authenticated first, then by provider/id. */
+	private rebuildItems() {
+		let models: any[] = [];
+		try {
+			models = this.reg?.getAll?.() ?? [];
+		} catch {
+			models = [];
+		}
+		const cur = this.roleModel(this.drillRole);
+		const multi = this.multiPick.includes(this.drillRole);
+		const selected = multi ? this.curMultiSet() : new Set<string>();
+		const items: DrillItem[] = models.map((m: any) => {
+			const provider = String(m?.provider ?? "");
+			const id = String(m?.id ?? "");
+			let authed = true;
+			try {
+				authed = this.reg?.hasConfiguredAuth?.(m) ?? true;
+			} catch {
+				authed = true;
+			}
+			return { model: `${provider}/${id}`, provider, id, name: String(m?.name ?? id), authed, selected: selected.has(`${provider}/${id}`) };
+		});
+		items.sort((a, b) => {
+			if (a.authed !== b.authed) return a.authed ? -1 : 1;
+			if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
+			return a.id.localeCompare(b.id);
+		});
+		this.items = items;
+		const idx = items.findIndex((it) => it.model === cur);
+		if (idx >= 0) this.drillIndex = idx;
+	}
+	/** Apply the fuzzy filter to the full list (authenticated-first order preserved). */
+	private filteredItems(): DrillItem[] {
+		if (!this.filter.trim()) return this.items;
+		return fuzzyFilter(this.items, this.filter.trim(), (it) => `${it.provider}/${it.id} ${it.name}`);
+	}
+	/** The set of models currently picked for a multi-pick role. */
+	private curMultiSet(): Set<string> {
+		const raw = this.working[this.drillRole]?.model ?? "";
+		return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
+	}
+
+	private rerender() {
+		try {
+			this.tui.requestRender();
+		} catch {
+			/* overlay already disposed */
+		}
+	}
+	private finish(result: "run" | "cancel") {
+		if (this.settled) return;
+		this.settled = true;
+		this.done(result);
+	}
+
+	/** Cycle a role's thinking override through inherit + the canonical levels. */
+	private cycleThinking(role: Role) {
+		const cur = this.working[role]?.thinking ?? "inherit";
+		const idx = THINKING_CYCLE.indexOf(cur);
+		const next = THINKING_CYCLE[(idx + 1) % THINKING_CYCLE.length]!;
+		const member = { ...(this.working[role] ?? { model: this.roleModel(role) }) };
+		if (next === "inherit") delete member.thinking;
+		else member.thinking = next;
+		this.working[role] = member;
+		this.rerender();
+	}
+
+	/** Assign a model to the drill role (single or multi-pick), then return to rows. */
+	private pick(model: string) {
+		const multi = this.multiPick.includes(this.drillRole);
+		if (multi) {
+			const set = this.curMultiSet();
+			if (set.has(model)) set.delete(model);
+			else set.add(model);
+			const arr = [...set].sort();
+			const member = { ...(this.working[this.drillRole] ?? { model: "" }) };
+			member.model = arr.join(",");
+			this.working[this.drillRole] = member;
+			this.rebuildItems();
+			this.rerender();
+			return; // stay in drill for multi-pick
+		}
+		const member = { ...(this.working[this.drillRole] ?? { model: "" }), model };
+		const prev = this.working[this.drillRole];
+		if (prev?.thinking) member.thinking = prev.thinking;
+		this.working[this.drillRole] = member;
+		this.mode = "rows";
+		this.rerender();
+	}
+
+	// ── Component interface ────────────────────────────────────────────────────
+	handleInput(data: string): void {
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+			if (this.mode === "rows") this.finish("cancel");
+			else {
+				this.mode = "rows";
+				this.rerender();
+			}
+			return;
+		}
+		if (this.mode === "manual") return this.handleManual(data);
+		if (this.mode === "drill") return this.handleDrill(data);
+		return this.handleRows(data);
+	}
+
+	private handleRows(data: string) {
+		const roleCount = this.roles.length;
+		const total = roleCount + 2; // +SAVE +RUN
+		if (matchesKey(data, "return")) {
+			this.activateRow();
+		} else if (matchesKey(data, "down") || matchesKey(data, "tab")) {
+			this.cursor = (this.cursor + 1) % total;
+			this.rerender();
+		} else if (matchesKey(data, "up") || matchesKey(data, "shift+tab")) {
+			this.cursor = (this.cursor - 1 + total) % total;
+			this.rerender();
+		} else if (this.cursor < roleCount) {
+			const role = this.roles[this.cursor]!;
+			const k = data.toLowerCase();
+			if (k === "e") this.enterDrill(role);
+			else if (k === "m") this.enterManual(role);
+			else if (k === "t") this.cycleThinking(role);
+		}
+	}
+	private activateRow() {
+		const roleCount = this.roles.length;
+		if (this.cursor < roleCount) this.enterDrill(this.roles[this.cursor]!);
+		else if (this.cursor === roleCount) this.doSave();
+		else this.doRun();
+	}
+
+	private handleDrill(data: string) {
+		if (matchesKey(data, "return")) {
+			const list = this.filteredItems();
+			const it = list[this.drillIndex];
+			if (it) this.pick(it.model);
+			return;
+		}
+		if (matchesKey(data, "backspace")) {
+			if (this.filter) {
+				this.filter = this.filter.slice(0, -1);
+				this.clampDrill();
+				this.rerender();
+			} else {
+				this.mode = "rows";
+				this.rerender();
+			}
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			this.drillIndex = Math.max(0, this.drillIndex - 1);
+			this.clampDrill();
+			this.rerender();
+		} else if (matchesKey(data, "down")) {
+			const list = this.filteredItems();
+			this.drillIndex = Math.min(list.length - 1, this.drillIndex + 1);
+			this.clampDrill();
+			this.rerender();
+		} else if (matchesKey(data, "space") && this.multiPick.includes(this.drillRole)) {
+			const list = this.filteredItems();
+			const it = list[this.drillIndex];
+			if (it) this.pick(it.model);
+		} else if (data.length === 1 && data.charCodeAt(0) >= 32) {
+			this.filter += data;
+			this.clampDrill();
+			this.rerender();
+		}
+	}
+	private clampDrill() {
+		const list = this.filteredItems();
+		if (this.drillIndex > list.length - 1) this.drillIndex = Math.max(0, list.length - 1);
+		if (this.drillIndex < this.drillScroll) this.drillScroll = this.drillIndex;
+		if (this.drillIndex >= this.drillScroll + this.maxListRows) this.drillScroll = this.drillIndex - this.maxListRows + 1;
+	}
+
+	private enterManual(role: Role) {
+		this.drillRole = role;
+		this.mode = "manual";
+		this.manualInput.setValue(this.roleModel(role));
+		this.manualInput.focused = true;
+		this.focused = true;
+		this.rerender();
+	}
+	private handleManual(data: string) {
+		if (matchesKey(data, "return")) {
+			const v = this.manualInput.getValue().trim();
+			if (v) {
+				const prev = this.working[this.drillRole];
+				this.working[this.drillRole] = { model: v, ...(prev?.thinking ? { thinking: prev.thinking } : {}) };
+			}
+			this.mode = "rows";
+			this.focused = false;
+			this.rerender();
+			return;
+		}
+		this.manualInput.handleInput(data);
+		this.rerender();
+	}
+
+	private doRun() {
+		this.onCommit(this.working);
+		this.finish("run");
+	}
+	private doSave() {
+		const file = this.onSave(this.working);
+		this.onCommit(this.working);
+		this.savedMsg = `saved → ${file}`;
+		this.rerender();
+		setTimeout(() => {
+			this.savedMsg = "";
+			this.rerender();
+		}, 2500);
+	}
+
+	invalidate() {}
+	dispose() {
+		if (!this.settled) this.finish("cancel");
+	}
+
+	render(width: number): string[] {
+		if (this.mode === "drill") return this.renderDrill(width);
+		if (this.mode === "manual") return this.renderManual(width);
+		return this.renderRows(width);
+	}
+
+	private renderRows(width: number): string[] {
+		const innerW = Math.max(40, Math.min(width - 2, 92));
+		const lines: string[] = [];
+		const head = this.command ? `CAST · /${this.command}` : "CAST · /roles";
+		lines.push(themelessHeader(head, innerW));
+		lines.push(`  role         model                                          thinking   auth`);
+		lines.push(`  ${"─".repeat(innerW - 2)}`);
+		this.roles.forEach((role, i) => {
+			const sel = i === this.cursor ? "▸ " : "  ";
+			const auth = this.authMarker(role);
+			const model = truncateToWidth(this.roleModel(role), 44);
+			const th = truncateToWidth(this.roleThinkingDisplay(role), 10);
+			const name = truncateToWidth(`${ROLE_GLYPH[role]} ${role}`.padEnd(12), 12);
+			lines.push(`${sel}${name} ${model.padEnd(44)} ${th.padEnd(10)} ${auth}`);
+		});
+		lines.push(`  ${"─".repeat(innerW - 2)}`);
+		const saveSel = this.cursor === this.roles.length ? "▸ " : "  ";
+		const runSel = this.cursor === this.roles.length + 1 ? "▸ " : "  ";
+		lines.push(`${saveSel}[S] SAVE cast to ${CAST_FILE}`);
+		lines.push(`${runSel}[⏎] RUN with this cast`);
+		lines.push("");
+		lines.push(`  ↑↓ move · ⏎/e edit row · m manual · t thinking · S save · Esc cancel${this.savedMsg ? `   ✓ ${this.savedMsg}` : ""}`);
+		return borderBox(lines, innerW);
+	}
+
+	private renderDrill(width: number): string[] {
+		const innerW = Math.max(40, Math.min(width - 2, 92));
+		const list = this.filteredItems();
+		const multi = this.multiPick.includes(this.drillRole);
+		const lines: string[] = [
+			themelessHeader(`${ROLE_GLYPH[this.drillRole]} ${this.drillRole} · pick a model`, innerW),
+			`  filter: ${this.filter}${this.filter ? "_" : ""}   (${list.length} match${list.length === 1 ? "" : "s"}${multi ? " · space toggles · ⏎ done" : " · ⏎ select"})`,
+			`  ${"─".repeat(innerW - 2)}`,
+		];
+		const visible = list.slice(this.drillScroll, this.drillScroll + this.maxListRows);
+		visible.forEach((it, vi) => {
+			const idx = this.drillScroll + vi;
+			const sel = idx === this.drillIndex ? "▸ " : "  ";
+			const box = multi ? (it.selected ? "☑" : "☐") : (it.selected ? "●" : " ");
+			const auth = it.authed ? "✓" : "✗";
+			const model = truncateToWidth(`${it.provider}/${it.id}`, 40);
+			const name = truncateToWidth(it.name, innerW - 40 - 12);
+			lines.push(`${sel}${box} ${auth} ${model.padEnd(40)} ${name}`);
+		});
+		for (let i = visible.length; i < this.maxListRows; i++) lines.push("");
+		lines.push(`  ${"─".repeat(innerW - 2)}`);
+		lines.push("  type to filter · ↑↓ move · ⏎ select · ⌫ back · Esc cancel");
+		return borderBox(lines, innerW);
+	}
+
+	private renderManual(width: number): string[] {
+		const innerW = Math.max(40, Math.min(width - 2, 92));
+		this.manualInput.focused = true;
+		const [inputLine = ""] = this.manualInput.render(Math.max(10, innerW - 22));
+		const lines: string[] = [
+			themelessHeader(`${ROLE_GLYPH[this.drillRole]} ${this.drillRole} · manual entry`, innerW),
+			"  Type a literal provider/id (for catalog-lagged models):",
+			`  > ${inputLine}`,
+			"",
+			"  ⏎ confirm · Esc cancel",
+		];
+		return borderBox(lines, innerW);
+	}
+
+	/** Auth marker for a row: ✓ authed, ✗ missing, ? unknown (registry absent). */
+	private authMarker(role: Role): string {
+		try {
+			const model = this.roleModel(role);
+			const { provider, id } = { provider: model.slice(0, model.indexOf("/")), id: model.slice(model.indexOf("/") + 1) };
+			if (!provider || !id || model.indexOf("/") < 0) return "?";
+			const found = this.reg?.find?.(provider, id);
+			if (!found) return "✗";
+			return this.reg?.hasConfiguredAuth?.(found) ? "✓" : "✗";
+		} catch {
+			return "?";
+		}
+	}
+}
+
+/** A plain (theme-less) centered header line for the cast sheet boxes. */
+function themelessHeader(title: string, width: number): string {
+	const pad = Math.max(0, width - visibleWidth(title) - 2);
+	const left = Math.floor(pad / 2);
+	return ` ${" ".repeat(left)}${title}${" ".repeat(pad - left)}`;
+}
+/** Wrap rendered lines in a simple Unicode border box of the given inner width. */
+function borderBox(lines: string[], innerW: number): string[] {
+	const top = `╭${"─".repeat(innerW)}╮`;
+	const bot = `╰${"─".repeat(innerW)}╯`;
+	const body = lines.map((l) => `│${truncateToWidth(l || "", innerW, "", true).padEnd(innerW)}│`);
+	return [top, ...body, bot];
+}
+
 // ═══ 8. Extension ════════════════════════════════════════════════════════════
 
 export default function (pi: ExtensionAPI) {
@@ -974,8 +1395,82 @@ export default function (pi: ExtensionAPI) {
 		const v = pi.getFlag(name);
 		return typeof v === "string" ? v.trim() : "";
 	};
-	const architectModel = () => flagStr("architect") || DEFAULT_ARCHITECT; // resolved per call — flags are static, but cheap to re-read
-	const builderModel = () => flagStr("builder") || DEFAULT_BUILDER;
+
+	// ── 8.2b The CAST: role → { model, thinking? } (multi-provider-cast) ──
+	// The single source of truth for which model plays which role. Seeded at boot in
+	// precedence order: built-in defaults → project cast file → --architect/--builder
+	// flags (override the file) → session mutations (picker, /roles, /thinking).
+	const cast: Cast = {};
+
+	/** The raw flag value for a side's model (architect/builder). */
+	const architectFlag = (): string => flagStr("architect");
+	const builderFlag = (): string => flagStr("builder");
+
+	/** Read <cwd>/.fusion-harness.json forgivingly. Unknown roles are ignored; no model
+	 *  validation happens here (preflight catches bad ids at first use — never at boot). */
+	const readProjectCast = (cwd: string): Cast => {
+		try {
+			const raw = fs.readFileSync(path.join(cwd, CAST_FILE), "utf-8");
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			const out: Cast = {};
+			for (const [role, val] of Object.entries(parsed)) {
+				if (!isKnownRole(role) || !val || typeof val !== "object") continue;
+				const m = (val as { model?: unknown; thinking?: unknown }).model;
+				if (typeof m !== "string" || !m.trim()) continue;
+				const member: CastMember = { model: m.trim() };
+				const t = (val as { thinking?: unknown }).thinking;
+				if (typeof t === "string" && t.trim()) {
+					const lvl = THINKING_ALIAS[t.trim().toLowerCase()];
+					if (lvl) member.thinking = lvl;
+				}
+				out[role] = member;
+			}
+			return out;
+		} catch {
+			return {};
+		}
+	};
+
+	/** True once the cast has been seeded for the session (defaults → file → flags). */
+	let castSeeded = false;
+	let castFileLoaded = false;
+	/** Seed the cast: defaults + flags eagerly, and the project cast file once a cwd is known. Idempotent. */
+	const seedCast = (cwd?: string) => {
+		if (!castSeeded) {
+			castSeeded = true;
+			cast.ARCHITECT ??= { model: DEFAULT_ARCHITECT };
+			cast.BUILDER ??= { model: DEFAULT_BUILDER };
+			const archFlag = architectFlag();
+			if (archFlag) cast.ARCHITECT = { ...cast.ARCHITECT, model: archFlag };
+			const buildFlag = builderFlag();
+			if (buildFlag) cast.BUILDER = { ...cast.BUILDER, model: buildFlag };
+		}
+		if (cwd && !castFileLoaded) {
+			castFileLoaded = true;
+			for (const [role, member] of Object.entries(readProjectCast(cwd))) cast[role] = { ...member };
+			const archFlag = architectFlag();
+			if (archFlag) cast.ARCHITECT = { ...cast.ARCHITECT, model: archFlag };
+			const buildFlag = builderFlag();
+			if (buildFlag) cast.BUILDER = { ...cast.BUILDER, model: buildFlag };
+		}
+	};
+
+	/** The model a role runs on: its cast entry, else its side primary's, else the default. */
+	const castModel = (role: Role): string => {
+		seedCast();
+		const m = cast[role]?.model;
+		if (m) return m;
+		const primary = SIDE_PRIMARY[ROLE_SIDE[role]];
+		return primary === role ? (ROLE_SIDE[role] === "architect" ? DEFAULT_ARCHITECT : DEFAULT_BUILDER) : castModel(primary);
+	};
+	/** Legacy side accessors — the footer and session keying are side-shaped. */
+	const architectModel = (): string => castModel("ARCHITECT");
+	const builderModel = (): string => castModel("BUILDER");
+	/** Write the whole cast at once (used by the sheet's RUN/SAVE and /thinking role mode). */
+	const setCast = (next: Cast) => {
+		for (const k of Object.keys(cast)) delete cast[k];
+		Object.assign(cast, next);
+	};
 
 	/** --<role>-system-prompt: inline text, or a file path (file contents win if it exists). */
 	const roleSystemPrompt = (role: "architect" | "builder"): string | undefined => {
@@ -1021,24 +1516,6 @@ export default function (pi: ExtensionAPI) {
 	/** The /auto-validate builder does real work — never below the 8h floor, even with a small --child-timeout. */
 	const buildTimeoutMs = (): number => Math.max(childTimeoutMs(), BUILD_TIMEOUT_MS_FLOOR);
 
-	/** --<role>-thinking: one thinking level for EVERY execution of that model. Default medium. */
-	type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-	const THINKING_LEVELS: Thinking[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-	/**
-	 * Accept BOTH the canonical level and the short form the footer prints (`high` and `hi`,
-	 * `medium` and `med`, `off` and `none`, …). The footer only ever shows the short form, so
-	 * refusing it would mean rejecting the exact word the UI just displayed.
-	 */
-	const THINKING_ALIAS: Record<string, Thinking> = {};
-	for (const level of THINKING_LEVELS) {
-		THINKING_ALIAS[level] = level;
-		const short = THINKING_SHORT[level];
-		if (short) THINKING_ALIAS[short] = level;
-	}
-	const resolveThinking = (raw: string): Thinking | undefined => THINKING_ALIAS[raw.trim().toLowerCase()];
-	/** Human help: `off|none, minimal|min, low, medium|med, high|hi, xhigh|xhi, max`. */
-	const THINKING_HELP = THINKING_LEVELS.map((l) => (THINKING_SHORT[l] && THINKING_SHORT[l] !== l ? `${l}|${THINKING_SHORT[l]}` : l)).join(", ");
-
 	/** /thinking overrides the boot flag for the rest of the session (per role, in memory). */
 	const thinkingOverride: Partial<Record<"architect" | "builder", Thinking>> = {};
 	const roleThinking = (role: "architect" | "builder"): Thinking => {
@@ -1047,6 +1524,8 @@ export default function (pi: ExtensionAPI) {
 		// The boot flags take the same aliases, so `--architect-thinking hi` works too.
 		return resolveThinking(flagStr(`${role}-thinking`)) ?? "medium";
 	};
+	/** A role's thinking: its cast override, else its side's current level (including mid-session /thinking). */
+	const castThinking = (role: Role): Thinking => cast[role]?.thinking ?? roleThinking(ROLE_SIDE[role]);
 
 	// ── 8.3 Shared live state (widget + footer read this) ──────
 	// Left cell = ARCHITECT-family (ARCHITECT/FUSION/VALIDATOR), right cell = BUILDER.
@@ -1490,6 +1969,13 @@ export default function (pi: ExtensionAPI) {
 				duoBody();
 				break;
 			}
+			case "preflight": {
+				add(new Text(theme.fg("error", theme.bold(`✗ FUSION HARNESS · /${d.command ?? "?"} — PREFLIGHT FAILED`)), 1, 0));
+				if (d.catalogError) add(new Text(theme.fg("warning", `  ⚠ model catalog failed to refresh: ${d.catalogError}`), 1, 0));
+				blank();
+				md(content);
+				break;
+			}
 			default: {
 				// "error" and anything else: attributed failure, loud and specific.
 				add(new Text(theme.fg("error", theme.bold(`✗ FUSION HARNESS · /${d.command ?? "?"} FAILED`)), 1, 0));
@@ -1555,9 +2041,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Live two-column widget while children run: left agent | right agent, each
-	 * streaming its own flow (tool lines + response text), plus an optional
-	 * full-width span row (the FUSION merge stage). Re-set every tick.
+	 * Live widget while children run. For ≤2 active runs it renders the existing
+	 * two-column streaming layout. For >2 runs it switches to a compact
+	 * one-line-per-run mode. The optional `span` row is rendered full-width.
 	 */
 	const startWidget = (
 		ctx: any,
@@ -1583,10 +2069,12 @@ export default function (pi: ExtensionAPI) {
 								0,
 							),
 						);
-						c.addChild(new TwoCol((colW) => ({ left: liveColumn(theme, cols[0], colW), right: liveColumn(theme, cols[1], colW) }), theme.fg("dim", " │ ")));
+						c.addChild(new TwoCol((colW) => ({
+							left: liveColumn(theme, cols[0], colW),
+							right: cols[1] ? liveColumn(theme, cols[1], colW) : [],
+						}), theme.fg("dim", " │ ")));
 						if (span && span.status !== "pending") {
 							c.addChild(new Text("", 0, 0));
-							// Real width, not a guess — the FUSION row spans the whole terminal.
 							c.addChild(new FullWidth((w) => liveColumn(theme, span, w)));
 						}
 						return c;
@@ -1665,6 +2153,150 @@ export default function (pi: ExtensionAPI) {
 		totalCostUsd: runs.reduce((s, r) => s + r.costUsd, 0),
 	});
 
+	// ── 8.7b Preflight: validate every cast model resolves + is authenticated ──
+	type PreflightFailure = { role: Role; model: string; kind: "unresolved" | "no-auth"; provider: string; id: string };
+	const splitModel = (model: string): { provider: string; id: string } => {
+		const slash = model.indexOf("/");
+		return slash > 0 ? { provider: model.slice(0, slash), id: model.slice(slash + 1) } : { provider: model, id: "" };
+	};
+	const preflightCast = (roles: Role[], ctx: any): { failures: PreflightFailure[]; catalogError?: string } => {
+		seedCast(ctx.cwd);
+		const failures: PreflightFailure[] = [];
+		let catalogError: string | undefined;
+		try {
+			catalogError = ctx.modelRegistry?.getError?.();
+		} catch {
+			catalogError = undefined;
+		}
+		for (const role of roles) {
+			const model = castModel(role);
+			const { provider, id } = splitModel(model);
+			if (!provider || !id) {
+				failures.push({ role, model, kind: "unresolved", provider, id });
+				continue;
+			}
+			let found: any;
+			try {
+				found = ctx.modelRegistry?.find?.(provider, id);
+			} catch {
+				found = undefined;
+			}
+			if (!found) {
+				failures.push({ role, model, kind: "unresolved", provider, id });
+				continue;
+			}
+			let authed = true;
+			try {
+				authed = ctx.modelRegistry?.hasConfiguredAuth?.(found) ?? true;
+			} catch {
+				authed = true;
+			}
+			if (!authed) failures.push({ role, model, kind: "no-auth", provider, id });
+		}
+		return { failures, catalogError };
+	};
+	const PROVIDER_AUTH: Record<string, { env?: string; login: string; note?: string }> = {
+		anthropic: { env: "ANTHROPIC_API_KEY", login: "anthropic" },
+		openai: { env: "OPENAI_API_KEY", login: "openai" },
+		zai: { env: "ZAI_API_KEY", login: "zai" },
+		"zai-coding-cn": { env: "ZAI_API_KEY", login: "zai" },
+		opencode: { env: "OPENCODE_API_KEY", login: "opencode" },
+		"opencode-go": { env: "OPENCODE_API_KEY", login: "opencode" },
+		gemini: { env: "GEMINI_API_KEY", login: "gemini" },
+		google: { env: "GEMINI_API_KEY", login: "gemini" },
+		xai: { env: "XAI_API_KEY", login: "xai" },
+		grok: { env: "XAI_API_KEY", login: "xai" },
+		deepseek: { env: "DEEPSEEK_API_KEY", login: "deepseek" },
+		kimi: { env: "MOONSHOT_API_KEY", login: "kimi" },
+		moonshot: { env: "MOONSHOT_API_KEY", login: "kimi" },
+		mistral: { env: "MISTRAL_API_KEY", login: "mistral" },
+		openrouter: { env: "OPENROUTER_API_KEY", login: "openrouter" },
+	};
+	const preflightLine = (f: PreflightFailure): string => {
+		const who = `${ROLE_GLYPH[f.role]} ${f.role} · ${f.model}`;
+		if (f.kind === "no-auth") {
+			const a = PROVIDER_AUTH[f.provider] ?? { env: `${f.provider.toUpperCase().replace(/-/g, "_")}_API_KEY`, login: f.provider };
+			return `${who}\n   ✗ not authenticated. Run:  /login ${a.login}    (or set the ${a.env} environment variable)`;
+		}
+		const stanza = JSON.stringify(
+			{ providers: { [f.provider]: { models: [{ id: f.id, name: f.id, reasoning: true, input: ["text"], cost: {}, contextWindow: 200_000, maxTokens: 8192 }] } } },
+			null,
+			2,
+		);
+		return `${who}\n   ✗ could not resolve (typo, unknown provider, or a freshly released model not yet in the catalog).\n   Add it to ~/.pi/agent/models.json, then retry:\n   ${stanza.split("\n").join("\n   ")}`;
+	};
+	const preflightBody = (failures: PreflightFailure[], catalogError?: string): string => {
+		const lines = failures.map(preflightLine);
+		if (catalogError)
+			lines.push(`⚠ The model catalog failed to refresh: ${catalogError}.\n   A model below may still be valid — check models.json / the provider before assuming a typo.`);
+		return `Preflight found ${failures.length} problem${failures.length === 1 ? "" : "s"} — nothing spawned, no artifacts directory was created.\n\n${lines.join("\n\n")}`;
+	};
+	const preflightOrFail = async (roles: Role[], ctx: any, command: string): Promise<boolean> => {
+		const { failures, catalogError } = preflightCast(roles, ctx);
+		if (!failures.length) return true;
+		const body = preflightBody(failures, catalogError);
+		if (ctx.hasUI) {
+			panel({ kind: "preflight", command: command as any, ok: false, preflightFailures: failures, catalogError }, body);
+		} else {
+			ctx.ui.notify(`fusion-harness: /${command} aborted — preflight failed.\n${body}`, "error");
+		}
+		return false;
+	};
+
+	// ── 8.7c Cast sheet + /roles ─────────────────────────────────────────────────
+	const stripCastDefaults = (raw: string): { rest: string; skip: boolean } => {
+		let skip = false;
+		const rest = (raw ?? "")
+			.replace(/(^|\s)--cast-defaults(?=\s|$)/g, (_m, lead) => {
+				skip = true;
+				return lead;
+			})
+			.trim();
+		return { rest, skip };
+	};
+	const saveProjectCastUsing = (cwd: string, next: Cast): string => {
+		const out: Record<string, CastMember> = {};
+		for (const role of KNOWN_ROLES) if (next[role]) out[role] = { ...next[role] };
+		const file = path.join(cwd, CAST_FILE);
+		fs.writeFileSync(file, JSON.stringify(out, null, 2) + "\n", "utf-8");
+		return file;
+	};
+	const castSummary = (): string =>
+		KNOWN_ROLES.filter((r) => cast[r]).map((r) => `${ROLE_GLYPH[r]} ${r} = ${cast[r]!.model}${cast[r]!.thinking ? ` (${cast[r]!.thinking})` : ""}`).join("\n");
+	const openCastSheet = async (ctx: any, roles: Role[], opts: { command?: string; multiPick?: Role[] } = {}): Promise<"run" | "cancel"> => {
+		seedCast(ctx.cwd);
+		const ui = ctx.ui as unknown as ExtensionUIContext;
+		const result = await ui.custom<"run" | "cancel">(
+			(tui: TUI, _theme: any, _kb: any, done) =>
+				new CastSheet({
+					tui,
+					roles,
+					working: { ...cast },
+					modelRegistry: ctx.modelRegistry,
+					cwd: ctx.cwd,
+					command: opts.command,
+					multiPick: opts.multiPick ?? [],
+					onCommit: (next: Cast) => Object.assign(cast, next),
+					onSave: (next: Cast) => saveProjectCastUsing(ctx.cwd, next),
+					done,
+				}),
+			{ overlay: true, overlayOptions: { anchor: "center", width: 78, maxHeight: 24 } },
+		);
+		return result ?? "cancel";
+	};
+	const COMMAND_CAST: Record<string, Role[]> = {
+		fusion: ["ARCHITECT", "BUILDER", "FUSION"],
+		"auto-validate": ["VALIDATOR", "BUILDER"],
+		opinion: ["ARCHITECT", "BUILDER"],
+	};
+	const runCastGate = async (ctx: any, command: string, skip: boolean): Promise<boolean> => {
+		const roles = COMMAND_CAST[command] ?? KNOWN_ROLES;
+		if (!skip && ctx.hasUI && ctx.mode === "tui") {
+			if ((await openCastSheet(ctx, roles, { command })) !== "run") return false;
+		}
+		return preflightOrFail(roles, ctx, command);
+	};
+
 	// ── 8.8 Boot banner — big centered "FUSION HARNESS" when the harness starts ──
 	// TUI + fresh startup only: no banner noise in headless JSON streams, and no repeat
 	// banner on /new, /resume, forks, or extension reloads.
@@ -1683,31 +2315,80 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── 8.10 /thinking <architect> [builder] — retune thinking mid-session ──
-	// Overrides --architect-thinking/--builder-thinking without a restart. Applies to the
-	// NEXT command: children are spawned per command and read roleThinking() at spawn time.
+	// ── 8.10 /thinking — retune thinking mid-session (sides AND roles) ───────────
+	const isSideName = (s: string): s is Side => s === "architect" || s === "builder";
+	const isRoleName = (s: string): boolean => /^[A-Z][A-Z0-9_-]*$/.test(s);
 	pi.registerCommand("thinking", {
-		description: `Set thinking levels: /thinking <architect> [builder] (${THINKING_HELP}). Builder is optional — omit it to leave it unchanged. No args shows the current levels.`,
+		description: `Set thinking: /thinking <architect> [builder] (${THINKING_HELP}), or /thinking <ROLE|side> <level|inherit> (e.g. /thinking JUDGE low). No args shows current.`,
 		handler: async (args, ctx) => {
-			const current = () => `ARCHITECT ${roleThinking("architect")} · BUILDER ${roleThinking("builder")}`;
+			const sidesLine = () => `ARCHITECT ${roleThinking("architect")} · BUILDER ${roleThinking("builder")}`;
+			const overridesLine = () =>
+				KNOWN_ROLES.filter((r) => cast[r]?.thinking)
+					.map((r) => `${r} ${cast[r]!.thinking}`)
+					.join(" · ");
+			const showAll = () => {
+				const ov = overridesLine();
+				return ov ? `${sidesLine()}  (role overrides: ${ov})` : sidesLine();
+			};
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			if (!parts.length) {
-				ctx.ui.notify(`fusion-harness: thinking — ${current()}  (levels: ${THINKING_HELP})`, "info");
+				ctx.ui.notify(`fusion-harness: thinking — ${showAll()}  (levels: ${THINKING_HELP} · or inherit)`, "info");
 				return;
 			}
-			if (parts.length > 2) {
-				ctx.ui.notify(`fusion-harness: /thinking takes at most 2 levels — <architect> [builder]. Got ${parts.length}.`, "error");
+			// (b) Targeted: /thinking <ROLE|side> <level|inherit>
+			const firstIsLevel = !!resolveThinking(parts[0]!);
+			const firstIsTarget = !firstIsLevel && (isSideName((parts[0]!.toLowerCase() as string)) || isRoleName(parts[0]!));
+			if (parts.length === 2 && firstIsTarget) {
+				const target = parts[0]!;
+				const lvlRaw = parts[1]!.toLowerCase();
+				const side = target.toLowerCase();
+				const isSide = isSideName(side);
+				const clear = lvlRaw === "inherit" || lvlRaw === "default";
+				if (!clear && !resolveThinking(parts[1]!)) {
+					ctx.ui.notify(`fusion-harness: invalid thinking level: ${parts[1]}. Valid: ${THINKING_HELP} · or inherit`, "error");
+					return;
+				}
+				if (isSide) {
+					const s = side as Side;
+					if (clear) delete thinkingOverride[s];
+					else thinkingOverride[s] = resolveThinking(parts[1]!)!;
+				} else {
+					const r = (target.toUpperCase() as Role);
+					seedCast(ctx.cwd);
+					if (clear) { if (cast[r]) delete cast[r]!.thinking; }
+					else cast[r] = { model: castModel(r), thinking: resolveThinking(parts[1]!)! };
+				}
+				ctx.ui.notify(`fusion-harness: thinking → ${target} ${clear ? "inherit" : resolveThinking(parts[1]!)} — applies to the next command`, "info");
 				return;
 			}
-			const bad = parts.filter((p) => !resolveThinking(p));
-			if (bad.length) {
-				ctx.ui.notify(`fusion-harness: invalid thinking level: ${bad.join(", ")}. Valid: ${THINKING_HELP}`, "error");
+			// (a) Legacy: /thinking <architect-level> [builder-level]
+			if (parts.length <= 2 && parts.every((p) => resolveThinking(p))) {
+				thinkingOverride.architect = resolveThinking(parts[0]!)!;
+				if (parts[1]) thinkingOverride.builder = resolveThinking(parts[1]!)!;
+				ctx.ui.notify(`fusion-harness: thinking → ${showAll()}${parts[1] ? "" : " (builder unchanged)"} — applies to the next command`, "info");
 				return;
 			}
-			// Both forms normalize to the canonical level before it reaches a child's --thinking.
-			thinkingOverride.architect = resolveThinking(parts[0]);
-			if (parts[1]) thinkingOverride.builder = resolveThinking(parts[1]);
-			ctx.ui.notify(`fusion-harness: thinking → ${current()}${parts[1] ? "" : " (builder unchanged)"} — applies to the next command`, "info");
+			ctx.ui.notify(`fusion-harness: /thinking usage: /thinking <architect> [builder] OR /thinking <ROLE|side> <level|inherit>. Levels: ${THINKING_HELP}.`, "error");
+		},
+	});
+
+	// ── 8.10b /roles — review/set the session cast ──
+	pi.registerCommand("roles", {
+		description: "Open the cast sheet to review or set the session cast (models + thinking per role), then print it",
+		handler: async (_args, ctx) => {
+			if (ctx.hasUI && ctx.mode === "tui") {
+				const r = await openCastSheet(ctx, KNOWN_ROLES, {});
+				if (r !== "run") return;
+			}
+			seedCast(ctx.cwd);
+			let fileNote: string;
+			try {
+				const st = fs.statSync(path.join(ctx.cwd, CAST_FILE));
+				fileNote = `project cast file: ${CAST_FILE} (last written ${st.mtime.toISOString()})`;
+			} catch {
+				fileNote = `no project cast file — SAVE in the sheet (or /roles) writes ${CAST_FILE}`;
+			}
+			ctx.ui.notify(`fusion-harness: cast\n${castSummary() || "(no roles set)"}\n${fileNote}`, "info");
 		},
 	});
 
