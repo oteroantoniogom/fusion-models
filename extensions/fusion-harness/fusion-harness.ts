@@ -2270,8 +2270,29 @@ function borderBox(lines: string[], innerW: number): string[] {
 // note os.tmpdir() on macOS is /var/folders/…, so we pin /tmp explicitly).
 const ARTIFACT_ROOT_G = fs.existsSync("/tmp") ? "/tmp" : os.tmpdir();
 const mkArtifacts = async (): Promise<string> => fs.promises.mkdtemp(path.join(ARTIFACT_ROOT_G, "fusion-harness-"));
+// Per-session sink that surfaces gSave write failures to the user via ctx.ui.notify.
+// gSave is module-level (no ctx in scope), so the extension entrypoint wires this on
+// session_start. Previously gSave silently swallowed ALL write errors (`.catch(() => {})`),
+// which produced 0-byte artifacts and a misleading downstream "stage FAILED" on a full
+// disk (e.g. /tmp tmpfs at 100%) — this makes ENOSPC and friends loud instead of silent.
+let gSaveErrorSink: ((target: string, err: NodeJS.ErrnoException) => void) | undefined;
+// Codes that mean the write genuinely could not (and will not) land. Failing fast here
+// yields a precise recorded error (via the stage's try/catch) rather than a downstream
+// "file not found / empty" mystery. Other codes are logged but stay non-fatal, preserving
+// prior tolerance for transient blips.
+const GSAVE_FATAL_CODES = new Set(["ENOSPC", "EROFS", "EACCES", "EIO", "ENODEV", "ENOTDIR", "EBADF"]);
 const gSave = (dir: string, name: string, body: string) =>
-	fs.promises.writeFile(path.join(dir, name), body, "utf-8").catch(() => {});
+	fs.promises.writeFile(path.join(dir, name), body, "utf-8").catch((err: unknown) => {
+		const target = path.join(dir, name);
+		const e = err as NodeJS.ErrnoException;
+		const detail = e?.code ? `${e.code} — ${e.message}` : e?.message ?? String(err);
+		// Always visible in pi's stderr/logs…
+		console.error(`[fusion-harness] gSave FAILED to write ${target}: ${detail}`);
+		// …and bubble up as a user-facing notification if a UI sink is registered.
+		try { gSaveErrorSink?.(target, e); } catch { /* logging must never throw */ }
+		// Fail fast on hard I/O errors so the stage records the real cause.
+		if (e?.code && GSAVE_FATAL_CODES.has(e.code)) throw err;
+	});
 const gTotals = (runs: AgentRun[], startedAt: number) => ({
 	totalMs: Date.now() - startedAt,
 	totalCostUsd: runs.reduce((s, r) => s + r.costUsd, 0),
@@ -2280,6 +2301,20 @@ const gTotals = (runs: AgentRun[], startedAt: number) => ({
 // ═══ 8. Extension ════════════════════════════════════════════════════════════
 
 export default function (pi: ExtensionAPI) {
+	// ── 8.1a Artifact-write error sink ────────────────────────
+	// gSave is module-level (no ctx in scope), so wire its error hook to ctx.ui.notify
+	// here on session_start. Makes a full disk / unwritable artifact dir fail loudly
+	// instead of silently producing 0-byte files and a confusing downstream "stage FAILED".
+	pi.on("session_start", (_ev: any, ctx: any) => {
+		gSaveErrorSink = (target, err) => {
+			const code = err?.code ?? "write error";
+			const msg = err?.code === "ENOSPC"
+				? `fusion-harness: disk full (ENOSPC) — could not write ${target}. Free space on ${path.dirname(target)} and retry.`
+				: `fusion-harness: failed to write artifact ${target} (${code}: ${err?.message ?? ""}).`;
+			ctx?.ui?.notify?.(msg, err?.code === "ENOSPC" ? "error" : "warning");
+		};
+	});
+
 	// ── 8.1 Flags ──────────────────────────────────────────────
 	pi.registerFlag("architect", {
 		type: "string",
@@ -4560,9 +4595,16 @@ export default function (pi: ExtensionAPI) {
 		return JSON.parse(raw) as CampaignState;
 	};
 
-	/** Save campaign state to the dir's state.json. */
+	/** Save campaign state to the dir's state.json. Never throws — state persistence must
+	 *  not abort the campaign loop, and gSave has already logged/notify'd any ENOSPC.
+	 *  (On a full disk the state.json won't land either, but the per-stage error recorded
+	 *  in stage.artifacts["error"] still drives the halt + user message.) */
 	const saveCampaignState = async (dir: string, state: CampaignState): Promise<void> => {
-		await gSave(dir, "state.json", JSON.stringify(state, null, 2));
+		try {
+			await gSave(dir, "state.json", JSON.stringify(state, null, 2));
+		} catch (err) {
+			console.error(`[fusion-harness] saveCampaignState FAILED (state.json): ${String(err)}`);
+		}
 	};
 
 	/** Find the latest gauntlet-* dir in /tmp (or ARTIFACT_ROOT_G). */
