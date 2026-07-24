@@ -67,23 +67,28 @@ Used properly, fusion combines the intelligence AND the context windows of your 
 
 ---
 
-## The three commands
+## The five commands
 
 <p align="center">
   <img src="images/svg-03-three-commands.svg" alt="/opinion — side by side, /fusion — merged via a fusion agent, /auto-validate — validator gate + builder loop" width="780">
 </p>
 
-One extension file registers three slash commands. Every agent is a spawned `pi --mode json -p` subprocess with a fully qualified `provider/id` model, per-role thinking level, and artifacts under `/tmp/fusion-harness-*` (never inside this repo).
+One extension file registers five slash commands plus two coordination patterns. Every agent is a spawned `pi --mode json -p` subprocess with a fully qualified `provider/id` model, per-role thinking level, and artifacts under `/tmp/fusion-harness-*` (never inside this repo).
 
 Children are deliberately **clean-room**: every spawn gets `--no-skills --no-extensions --no-context-files`. `--no-extensions` keeps a child from recursively loading this harness; `--no-skills` / `--no-context-files` keep spawns lean and deterministic — each worker's entire contract comes from the harness's prompt files, identical on any machine regardless of what skills are installed. Only the HOST (raw chat) loads your skills and context files; children never do, even the builder children that fork the host session (a fork copies conversation history, but each child rebuilds its own system prompt from its own flags).
 
 | Command | Agents | What happens |
 |---|---|---|
 | `/opinion <prompt>` | 2 | Both models answer independently (every tool except write/edit). One panel compares them side by side — model, latency, tokens, cost — above both full answers. A pure A/B read. |
+| `/parallel <prompt>` | 2 | ARCHITECT and BUILDER execute the **same task with full tools** in parallel, no merge stage — a build-off with side-by-side results. Each agent's output renders independently. |
 | `/fusion "<prompt>" "<fusion-prompt>"` | 3 | ARCHITECT and BUILDER answer in parallel, both with full tools — either can build/render what you asked for. A third FUSION agent (architect model, fresh session, full tools) merges the two per your fusion instruction — default is a critical merge with `[ARCHITECT]`/`[BUILDER]` attribution and a **Consensus & Divergence** close. |
 | `/auto-validate <prompt>` | 2 + gate | The auto-validation loop: VALIDATOR designs an acceptance gate BEFORE any work happens, BUILDER builds, the gate runs, failures feed back verbatim until green or halt. Full breakdown below. |
+| `/debate <prompt> [--rounds N] [--reveal] [--no-early-stop]` | 2-3 | Multi-round debate: ARCHITECT-side and BUILDER-side debaters argue independently (round 1), then rebut each other's positions (rounds 2+ resume pinned sessions). An **early-stop convergence check** can end the debate when positions converge. A castable **JUDGE** renders the verdict on an **anonymized transcript** (Debater A/B; `--reveal` shows identities). —rounds N (default 2, clamp 1-5). |
+| `/coordinate <prompt> [--no-fix-up]` | 1+ | Manifest-driven orchestration: a COORDINATOR decomposes the task into a `subtasks.json` manifest (written to disk), the harness validates and schedules subtasks in dependency levels, and builder-side workers execute with path-partitioned write domains. The COORDINATOR re-enters to verify and gets **one fix-up pass** when gaps are found. |
+| `/council <prompt>` | K+1+ | Multi-model council: a PANEL of K models (multi-picked from the cast sheet) answers independently (fresh ephemeral sessions, OPINION_TOOLS). The harness **anonymizes** answers as Response A/B/C…, every panelist ranks the full set, ranks are aggregated with **Borda count**, and a CHAIRMAN synthesizes the final answer. Degrades gracefully if a panelist fails. |
+| `/redteam <prompt> [--rounds N]` | 2 | Adversarial build/attack loop: BUILDER builds with full tools, then an ATTACKER probes with OPINION_TOOLS (no write/edit). Each sortie ends with a strict `VERDICT: BREACH\|CONCEDE — <summary>` line. BREACH feeds back into the builder for a patch; CONCEDE ends green. Both sides resume their sessions across sorties. --rounds N (default 3, clamp 1-8). |
 
-### Same team, three outputs
+### Same team, eight outputs
 
 <p align="center">
   <img src="images/video-frames/fusion-value-ladder-switchboard.png" alt="Value ladder: /opinion gives 2 answers, /fusion gives 1 merged plan, /auto-validate gives a verified build" width="780">
@@ -163,7 +168,7 @@ The builder never grades its own homework, and the grader never touches the code
 
 Output clarity is the product. The harness mirrors the vanilla Pi experience (tool lines, streaming text, footer) but splits it into two columns it completely controls: ARCHITECT-family left, BUILDER right, aligned across the live widget, the final panels, and the footer.
 
-- Hard role + model labels with one consistent color per role: ARCHITECT ◆, BUILDER ▲, FUSION ⧉, VALIDATOR ✓.
+- Hard role + model labels with one consistent color per role: ARCHITECT ◆, BUILDER ▲, FUSION ⧉, VALIDATOR ✓, DEBATER_A ◈, DEBATER_B ◇, JUDGE ⚖, COORDINATOR ◎, PANEL ⊞, CHAIRMAN ♛, ATTACKER ⚡.
 - While children run, a live widget streams each agent's tool calls and text in its own column; the fusion stage renders as a full-width row.
 - Final panels render full-height into scrollback, so results scroll like normal messages: no hidden lines behind a toggle.
 - The footer is replaced with one aligned cell per model: `◆ ARCHITECT | model (med) | [██--------] 12%` (thinking level + context-window bar).
@@ -173,13 +178,115 @@ Every default prompt lives next to the extension as `SYSTEM_PROMPT_*.md` / `USER
 
 ---
 
-## Build your own patterns
+## The coordination commands
 
-<p align="center">
-  <img src="images/video-frames/fusion-patterns-gallery.png" alt="Shipped in this video: /opinion, /fusion, /auto-validate. Your turn: /debate, /parallel, /coordinate — your harness, your patterns" width="780">
-</p>
+Five coordination commands are now shipped alongside the original three, all built on the same spawn-and-render machinery. Each makes the cast sheet and preflight system available for multi-provider casting.
 
-The three shipped commands are a starting lineup, not the roster. The same spawn-and-render machinery supports any coordination pattern you can prompt: `/debate` (N rounds, two sides, one verdict), `/parallel` (same task, both models, no merge), `/coordinate` (agents plan together, then split the work). This is harness engineering: your tools directly limit what you believe is possible, and a harness you own is a harness you can extend the same afternoon you think of the idea.
+### `/parallel` — two-way build-off, no merge
+
+Agents: ARCHITECT + BUILDER (castable, both FULL_TOOLS)
+
+Both models execute the same task concurrently with full write/edit tools — a build-off. No merge, no fusion stage. Each agent's result renders in its own column; one agent's failure never suppresses the other's output.
+
+**Flags:** (none)
+
+**Cast rows:** ARCHITECT, BUILDER
+
+**Use case:** When you want two independent implementations to compare, or when the task is too simple to need a merge.
+
+### `/debate` — multi-round dialectic with a castable judge
+
+Agents: DEBATER A (architect side) + DEBATER B (builder side) + JUDGE (castable, fresh session)
+
+Round 1: both debaters answer in parallel with OPINION_TOOLS (read/bash — debate with evidence, no builds). Rounds 2+: each debater **resumes its pinned role session**, receives the opponent's last answer (truncated to the handoff cap), and produces a rebuttal — context accrues across rounds. After each rebuttal, an **early-stop convergence check** can end the debate early. The JUDGE renders the final verdict on a fresh ephemeral session with READONLY_TOOLS.
+
+**Flags:**
+- `--rounds N` — total exchanges (default 2, clamp 1-5)
+- `--reveal` — judge sees true model identities instead of anonymized "Debater A/B"
+- `--no-early-stop` — disable the convergence check, always run all rounds
+
+**Cast rows:** DEBATER A, DEBATER B, JUDGE
+
+**Transcript anonymization:** By default, the judge receives the full transcript with debaters labeled as "Debater A" and "Debater B" only. Model identity strings are best-effort stripped from the text. `--reveal` bypasses anonymization.
+
+**Cost:** bounded by rounds cap (max 5 total exchanges). Each round spawns two opinion-level agents + optional convergence check.
+
+### `/coordinate` — manifest-driven orchestration
+
+Agents: COORDINATOR (architect side, castable) + N WORKERS (builder-side ephemeral)
+
+**Stage 1 — Decomposition:** The COORDINATOR (VALIDATOR_TOOLS: read + write) analyzes the request and writes a `subtasks.json` manifest to a harness-dictated absolute path. The manifest follows a JSON schema with `id`, `title`, `prompt`, `paths` (write-domain globs), and `dependsOn` for each subtask.
+
+**Stage 2 — Level scheduling:** The harness JSON-validates the manifest (loud failure on missing/malformed), then schedules subtasks in dependency levels. Levels run sequentially; subtasks within a level run in **parallel** (`Promise.all`). Each worker is a fresh ephemeral builder-side session with FULL_TOOLS, receiving its owned paths and a strict prohibition on writing outside them.
+
+**Stage 3 — Integration:** The COORDINATOR resumes its session, receives per-subtask status + capped digests, and verifies with READONLY_TOOLS. When gaps are found, it gets **exactly one fix-up pass** (resume with FULL_TOOLS, address named gaps, re-verify). `--no-fix-up` disables the pass (report-only).
+
+**Flags:**
+- `--no-fix-up` — report-only integration; do not attempt fix-up on gaps
+
+**Cast rows:** COORDINATOR (WORKERS inherit the builder-side model)
+
+**Cost:** one COORDINATOR spawn + N worker spawns. Only one fix-up pass allowed per run.
+
+### `/council` — anonymized peer-ranking council
+
+Agents: PANEL (K models, multi-picked) + CHAIRMAN (castable, fresh ephemeral)
+
+**Stage 1 — Panel answers:** Every panelist answers the prompt in parallel with OPINION_TOOLS, each in a **fresh ephemeral session** (council members carry no memory). If a panelist fails, the council continues with survivors; below 2 survivors, it halts loudly.
+
+**Stage 2 — Anonymized ranking:** The harness anonymizes answers as Response A/B/C… (letter mapping held in memory; model-id strings are best-effort stripped). Each panelist then ranks the full anonymized set with one-line rationales. Malformed rankings (duplicate/missing letters) are excluded with a note.
+
+**Stage 3 — Aggregation + chairman synthesis:** Valid rankings are aggregated with **Borda count** (no extra model call — transparent arithmetic). The CHAIRMAN (fresh session, READONLY_TOOLS) receives the prompt, answers, and aggregate table, and synthesizes the final answer, noting consensus vs. split points.
+
+**Cast rows:** PANEL (multi-pick checkbox row, min 2 checked, defaults ARCHITECT+BUILDER pre-checked), CHAIRMAN (defaults to architect model)
+
+**Cost:** K panelist spawns + K ranking spawns + 1 chairman spawn. All ephemeral (no memory between councils).
+
+### `/redteam` — adversarial build/attack loop
+
+Agents: BUILDER (builder side) + ATTACKER (architect side, castable, OPINION_TOOLS)
+
+**Build stage:** BUILDER builds the request with FULL_TOOLS via the host-fork spawn (same alter-ego rules as `/auto-validate`'s builder).
+
+**Sortie loop:** The ATTACKER probes the result with OPINION_TOOLS (read, bash — no write/edit tools). Each sortie MUST end with a strict final line: `VERDICT: BREACH — <summary>` or `VERDICT: CONCEDE — <summary>`, parsed by line regex.
+- BREACH → the report feeds **verbatim** into the builder's resumed session for a patch
+- CONCEDE → the loop ends green
+- Missing verdict → retried once, then halt loudly with raw output
+
+Both sides **resume their sessions** across sorties (attack knowledge and patch context accrue). Reaching the round cap with a BREACH renders the last breach report loudly.
+
+**Flags:**
+- `--rounds N` — attack/patch cycles (default 3, clamp 1-8)
+
+**Cast rows:** BUILDER, ATTACKER
+
+**Cost:** 1 builder spawn + N attacker spawns + up to N builder patch spawns. Rounds cap bounded.
+
+### K-run rendering
+
+All coordination commands leverage the same K-run rendering system:
+- **Live widget:** ≤2 active runs → existing two-column streaming layout; >2 runs → compact one-line-per-run mode (glyph · role · model · status · last activity · tokens)
+- **Final panels:** Each run renders as one full-height panel in scrollback with role/model/stats header, in deterministic order
+- **Footer:** Stays two cells (architect-side, builder-side) regardless of run count
+- **Failure clarity:** Every run's terminal state (done, failed, timeout, aborted) is visible in both the compact widget and its final panel
+
+### Cost table
+
+| Command | Base spawns | Cost driver | Bounded by |
+|---|---|---|---|
+| `/parallel` | 2 (ARCHITECT + BUILDER) | Two full-tool agents | Single round |
+| `/debate` | 2 + JUDGE + convergence per round | Debate rounds + convergence checks | `--rounds` (1-5) |
+| `/coordinate` | 1 + N workers + optional fix-up | Subtask count + fix-up pass | Manifest size, one fix-up |
+| `/council` | K + K + 1 (CHAIRMAN) | Panelist count (double-spawn: answer + rank) + chairman | K panelists, single pass |
+| `/redteam` | 1 + up to 2N | Build + N attack/patch cycles | `--rounds` (1-8) |
+
+All costs are additive on top of the existing three commands. Rounds/clamp caps keep them bounded.
+
+### Build your own patterns
+
+The README's original "Build your own patterns" teaser promised these commands; they are now shipped. The same spawn-and-render machinery you've seen across all eight commands can express any coordination pattern you can prompt.
+
+This is harness engineering: a harness you own is a harness you can extend the same afternoon you think of the idea.
 
 ---
 
@@ -207,7 +314,7 @@ fusion-harness/
 │
 ├── extensions/
 │   └── fusion-harness/              # runtime only
-│       ├── fusion-harness.ts        # the whole harness — 3 commands, widget, footer, renderer
+│       ├── fusion-harness.ts        # the whole harness — 8 commands, widget, footer, renderer
 │       ├── SYSTEM_PROMPT_*.md       # validator + triage contracts
 │       └── USER_PROMPT_*.md         # every default prompt, {{VAR}} interpolated
 │
@@ -285,6 +392,18 @@ Every default prompt sits next to the extension with `{{VARIABLE}}` interpolatio
 | `USER_PROMPT_OPINION.md` | /opinion both agents |
 | `USER_PROMPT_BUILDER.md` · `USER_PROMPT_CORRECTION.md` | auto-validate build + correction rounds |
 | `USER_PROMPT_VALIDATOR.md` · `USER_PROMPT_TRIAGE.md` | gate design + triage requests |
+| `USER_PROMPT_DEBATE_OPENING.md` | /debate round 1 opening answers |
+| `USER_PROMPT_DEBATE_REBUTTAL.md` | /debate rounds 2+ rebuttals ({{OPPONENT_ANSWER}} slot) |
+| `USER_PROMPT_DEBATE_JUDGE.md` | /debate judge verdict contract |
+| `USER_PROMPT_DEBATE_CONVERGENCE.md` | /debate early-stop convergence check |
+| `USER_PROMPT_COORDINATOR.md` | /coordinate decomposition (subtasks.json manifest) |
+| `USER_PROMPT_COORDINATOR_WORKER.md` | /coordinate per-subtask worker prompt |
+| `USER_PROMPT_COORDINATOR_INTEGRATION.md` | /coordinate integration + verification |
+| `USER_PROMPT_COUNCIL_PANELIST.md` | /council stage 1 answer (no self-identification) |
+| `USER_PROMPT_COUNCIL_RANKING.md` | /council stage 2 ranking contract |
+| `USER_PROMPT_COUNCIL_CHAIRMAN.md` | /council stage 3 chairman synthesis |
+| `USER_PROMPT_REDTEAM_BUILDER.md` | /redteam builder build + patch |
+| `USER_PROMPT_REDTEAM_ATTACKER.md` | /redteam attacker sortie (VERDICT line contract) |
 
 ## Artifacts
 
@@ -311,6 +430,91 @@ Two models cover more blind spots than one, and the matrix is honest about the r
 - **Headless hosts can't fork**: with `--no-session` (headless runs), builder children fall back to a manifest-pinned persistent session instead of forking the host.
 
 ---
+
+## Multi-provider casting (v1.1+)
+
+Fusion Harness now supports **multi-provider casting**: instead of two hardcoded model slots (`--architect`/`--builder`), every role (ARCHITECT, BUILDER, FUSION, VALIDATOR — and future JUDGE, PANEL) can hold any model from any registered provider. The cast is the single source of truth for which model plays which role, seeded at boot and mutable at runtime.
+
+### Provider table
+
+| Provider key       | Auth env var            | `/login` command    | Notes                                                                 |
+|--------------------|-------------------------|---------------------|-----------------------------------------------------------------------|
+| `anthropic`        | `ANTHROPIC_API_KEY`     | `/login anthropic` | Built-in, always available.                                           |
+| `openai`           | `OPENAI_API_KEY`        | `/login openai`     | Built-in, always available.                                           |
+| `zai` / `zai-coding-cn` | `ZAI_API_KEY`      | `/login zai`        | Zhipu GLM models via `zai/glm-5.2`, `zai/glm-5-turbo` (requires key).|
+| `opencode` / `opencode-go` | `OPENCODE_API_KEY` | `/login opencode`   | OpenCode Zen models, dynamic catalog. Requires key.                   |
+| `gemini` / `google` | `GEMINI_API_KEY`       | `/login gemini`     | Google Gemini models.                                                 |
+| `xai` / `grok`     | `XAI_API_KEY`           | `/login xai`        | xAI Grok models.                                                      |
+| `deepseek`         | `DEEPSEEK_API_KEY`      | `/login deepseek`   | DeepSeek models.                                                      |
+| `kimi` / `moonshot` | `MOONSHOT_API_KEY`     | `/login kimi`       | Moonshot Kimi models.                                                 |
+| `mistral`          | `MISTRAL_API_KEY`       | `/login mistral`    | Mistral models.                                                       |
+| *(any)*            | `{PROVIDER}_API_KEY`    | `/login {provider}` | Fallback — known providers have dedicated entries; unknown ones use the generic `_API_KEY` pattern. |
+
+For brand-new model ids not yet in pi's catalog (catalog lag), add a `models.json` stanza:
+```json
+{ "providers": { "your-provider": { "models": [{ "id": "your-model-id", "name": "your-model-id", "reasoning": true, "input": ["text"], "cost": {}, "contextWindow": 200000, "maxTokens": 8192 }] } } }
+```
+To `~/.pi/agent/models.json`, then retry. Preflight catches unresolved ids before any spawn and prints an exact stanza skeleton.
+
+### The cast sheet (interactive picker)
+
+Every casted command (`/fusion`, `/auto-validate`, `/opinion`) opens a **cast sheet overlay** on invocation in TUI mode — one row per declared role, pre-filled from the current session cast:
+
+| Role       | Model                                | Thinking | Auth |
+|------------|--------------------------------------|----------|------|
+| ◆ ARCHITECT | anthropic/claude-fable-5             | med      | ✓    |
+| ▲ BUILDER   | openai/gpt-5.6-sol                   | med      | ✓    |
+| ⧉ FUSION    | _inherits ARCHITECT_                 | med      | ✓    |
+
+**Navigation**: `↑↓` move between rows, `⏎` or `e` drills into a provider→model list. Inside the drill-down, **type to filter** fuzzy-search narrows hundreds of models; authenticated models sort first. `m` opens a manual `provider/id` entry for catalog-lagged model ids. `t` cycles a row's thinking level (`inherit` → `off` → `minimal` → … → `max` → `inherit`).
+
+Two actions at the bottom:
+- **`[S] SAVE`** — writes the current cast to `<cwd>/.fusion-harness.json` AND updates the session cast.
+- **`[⏎] RUN`** — commits the cast to the session (models + thinking) and runs the command.
+- **`Esc`** — cancels the command with **zero side effects** (no artifacts dir, no spawn).
+
+**`--cast-defaults`** — any casted command accepts an inline `--cast-defaults` argument to skip the sheet for that invocation, using the current session cast as-is:
+```
+/opinion --cast-defaults Should we use Redis or Postgres?
+```
+
+### `/roles` command
+
+`/roles` opens the same cast sheet over **all known roles** (ARCHITECT, BUILDER, FUSION, VALIDATOR) outside any command. After closing the sheet, it prints the resulting session cast and the project cast file status. Use it to review or set session defaults.
+
+### Project cast file (`<cwd>/.fusion-harness.json`)
+
+SAVE in the sheet writes the current cast (roles → `{ model, thinking? }`) to `<cwd>/.fusion-harness.json` (pretty JSON). Boot seeding order:
+
+**built-in defaults → project file → `--architect`/`--builder` flags → session mutations**
+
+The file is forgiving: unknown roles are ignored, bad model ids are caught by preflight at first use (never at boot). Add `.fusion-harness.json` to your `.gitignore` unless you want to share a cast across the team.
+
+### Per-role thinking levels
+
+Each role carries an optional thinking override. The cast sheet shows it in a `thinking` column; `t` cycles through the levels (plus `inherit`). `--architect-thinking`/`--builder-thinking` flags seed side-level defaults. `/thinking` now accepts role names:
+```
+/thinking JUDGE low       # set the JUDGE role's thinking to low (fine for future use)
+/thinking architect high   # set the architect SIDE default to high
+/thinking ARCHITECT high   # role override (same effect for ARCHITECT, but explicit in the cast)
+/thinking                  # show side defaults + any role overrides
+```
+
+**Caveat**: thinking-level semantics vary across providers. A proxied provider may map levels differently or ignore them — the sheet shows what was requested; the child's actual behavior depends on `--thinking`. Check the provider's docs.
+
+### justfile presets
+
+Two multi-provider launch recipes are now included:
+
+```
+just fh-glm   # zai/glm-5.2 · zai/glm-5-turbo  (ZAI_API_KEY required)
+just fh-zen   # OpenCode Zen pair  (OPENCODE_API_KEY required, ids dynamic)
+```
+
+Plus a generic parameterized recipe:
+```
+just fh ARCH=zai/glm-5.2 BUILDER=opencode/zen-chat-plus
+```
 
 ## License
 

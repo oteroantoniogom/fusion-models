@@ -4,14 +4,20 @@ set dotenv-load := true
 # /fusion · /auto-validate · /opinion — fuse two frontier models (AND, not OR).
 # The HOST runs on the BUILDER model: raw (non-slash) input IS the builder agent.
 #
+# Generic casted launch:
+#   just fh ARCH=<model> BUILDER=<model>    — with the cast picker at invocation
+#     e.g. just fh ARCH=zai/glm-5.2 BUILDER=opencode/<model>
+#
 # Two launch recipes, two tiers — everything else is a flag:
 #
 #   just fh-workhorse    cheap pair (sonnet-5 plans · terra builds + hosts) — use for testing
 #   just fh-sota         frontier pair (fable-5 plans · sol builds + hosts) — the on-camera run
+#   just fh-glm          multi-provider: zai/glm-5.2 plans · zai/glm-5-turbo builds
+#   just fh-zen          multi-provider: OpenCode Zen pair (ids confirmed against live catalog)
 #
 # Configuration flags (all optional, appendable to either recipe):
 #   --architect <provider/id>              plans/fuses/validates
-#   --builder <provider/id>                builds
+#   --builder <provider/id>                builds (also hosts)
 #   --architect-thinking <level>           EVERY architect-family execution
 #   --builder-thinking <level>             EVERY builder execution
 #                                          (levels: off|minimal|low|medium|high|xhigh|max)
@@ -23,6 +29,7 @@ set dotenv-load := true
 #
 # e.g. just fh-workhorse --architect-thinking high --builder-system-prompt ./persona.md
 #      just fh-sota --architect-thinking max --builder-thinking max
+#      just fh-glm --cast-defaults  (skip the cast picker)
 #
 # Default prompts live in extensions/fusion-harness/{SYSTEM,USER}_PROMPT_*.md — edit to tune.
 # Sessions persist per project (/tmp/fusion-harness-sessions) — /fh-reset for fresh memories.
@@ -34,6 +41,15 @@ WORKHORSE_BUILDER := "openai/gpt-5.6-terra"
 # STATE-OF-THE-ART tier — the frontier, on-camera pair (fable 5 plans · sol builds + hosts).
 SOTA_ARCHITECT := "anthropic/claude-fable-5"
 SOTA_BUILDER := "openai/gpt-5.6-sol"
+
+# GLM tier — Zhipu GLM models via the zai provider (ENABLES multi-provider runs: ZAI_API_KEY required).
+GLM_ARCHITECT := "zai/glm-5.2"
+GLM_BUILDER := "zai/glm-5-turbo"
+
+# ZEN tier — OpenCode Zen models (ENABLES multi-provider runs: OPENCODE_API_KEY required).
+# Zen's model catalog is dynamic — confirm exact ids against the live catalog before production use.
+ZEN_ARCHITECT := "opencode/zen-chat"
+ZEN_BUILDER := "opencode/zen-chat-plus"
 
 default:
     @just --list
@@ -52,4 +68,27 @@ fh-sota *ARGS:
         --model {{SOTA_BUILDER}} \
         --architect {{SOTA_ARCHITECT}} --builder {{SOTA_BUILDER}} \
         --architect-thinking xhigh --builder-thinking xhigh \
+        {{ARGS}}
+
+# GLM multi-provider run (zai/glm-5.2 · zai/glm-5-turbo). Requires ZAI_API_KEY.
+fh-glm *ARGS:
+    pi -e extensions/fusion-harness/fusion-harness.ts \
+        --model {{GLM_BUILDER}} \
+        --architect {{GLM_ARCHITECT}} --builder {{GLM_BUILDER}} \
+        --architect-thinking medium --builder-thinking medium \
+        {{ARGS}}
+
+# ZEN multi-provider run (OpenCode Zen). Requires OPENCODE_API_KEY.
+fh-zen *ARGS:
+    pi -e extensions/fusion-harness/fusion-harness.ts \
+        --model {{ZEN_BUILDER}} \
+        --architect {{ZEN_ARCHITECT}} --builder {{ZEN_BUILDER}} \
+        --architect-thinking medium --builder-thinking medium \
+        {{ARGS}}
+
+# Generic casted launch: just fh ARCH=<model> BUILDER=<model> [extra flags]
+fh ARCH BUILDER *ARGS:
+    pi -e extensions/fusion-harness/fusion-harness.ts \
+        --model "{{BUILDER}}" \
+        --architect "{{ARCH}}" --builder "{{BUILDER}}" \
         {{ARGS}}

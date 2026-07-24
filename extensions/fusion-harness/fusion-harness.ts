@@ -3283,7 +3283,342 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── 8.14 /opinion <prompt> ─────────────────────────────────
+	// ── 8.14 /parallel <prompt> (two-way build-off, no merge) ──
+	pi.registerCommand("parallel", {
+		description: "ARCHITECT + BUILDER execute the same task with FULL_TOOLS in parallel, no merge stage — a build-off with side-by-side results",
+		handler: async (raw, ctx) => {
+			const { rest, skip } = stripCastDefaults(raw);
+			const prompt = (rest ?? "").trim();
+			if (!prompt) { ctx.ui.notify("Usage: /parallel <prompt>", "warning"); return; }
+			if (!(await runCastGate(ctx, "parallel", skip))) return;
+			const aModel = castModel("ARCHITECT");
+			const bModel = castModel("BUILDER");
+			const startedAt = Date.now();
+			const artifactsDir = await mkArtifacts();
+			await save(artifactsDir, "prompt.md", prompt);
+			panel({ kind: "prompt", command: "parallel", ok: true }, `/parallel ${prompt}`);
+			panel({ kind: "banner", command: "parallel", ok: true, prompt, roles: [{ role: "ARCHITECT", model: aModel }, { role: "BUILDER", model: bModel }], artifactsDir }, "");
+			const architect = newRun("ARCHITECT", aModel);
+			const builder = newRun("BUILDER", bModel);
+			const stopper = startStoppable(ctx, "parallel");
+			const stopWidget = startWidget(ctx, "parallel", [architect, builder], undefined, startedAt);
+			ctx.ui.setStatus(CUSTOM_TYPE, "parallel: both agents building…");
+			try {
+				await Promise.all([
+					runChild({ run: architect, prompt: workerPrompt("ARCHITECT", aModel, "BUILDER", bModel, prompt), systemPrompt: roleSystemPrompt("architect"), tools: FULL_TOOLS, thinking: castThinking("ARCHITECT"), sessionDir: roleSession("architect", ctx.cwd).dir, sessionId: roleSession("architect", ctx.cwd).id, cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal }),
+					runChild({ run: builder, prompt: workerPrompt("BUILDER", bModel, "ARCHITECT", aModel, prompt), systemPrompt: roleSystemPrompt("builder"), tools: FULL_TOOLS, thinking: castThinking("BUILDER"), ...builderSpawn(ctx, artifactsDir), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal }),
+				]);
+				if (stopper.stopped()) { stoppedPanel("parallel", [architect, builder], artifactsDir, startedAt, "Both agents were killed."); return; }
+				for (const r of [architect, builder]) await save(artifactsDir, `${r.role.toLowerCase()}.md`, runOk(r) ? r.text : `FAILED: ${runError(r)}`);
+				const ok = runOk(architect) && runOk(builder);
+				const t = totals([architect, builder], startedAt);
+				panel({ kind: "multi", command: "parallel", ok, sources: [toStat(architect), toStat(builder)], answers: [{ role: "ARCHITECT", model: aModel, text: runOk(architect) ? architect.text : "" }, { role: "BUILDER", model: bModel, text: runOk(builder) ? builder.text : "" }], artifactsDir, ...t }, [`## ARCHITECT · ${aModel}`, runOk(architect) ? architect.text : `FAILED: ${runError(architect)}`, ``, `## BUILDER · ${bModel}`, runOk(builder) ? builder.text : `FAILED: ${runError(builder)}`].join("\n"));
+				await save(artifactsDir, "summary.json", JSON.stringify({ command: "parallel", ok, agents: [toStat(architect), toStat(builder)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t }, null, 2));
+			} finally { stopper.release(); stopWidget(); ctx.ui.setStatus(CUSTOM_TYPE, undefined); }
+		},
+	});
+
+	// ── 8.15 /debate <prompt> [--rounds N] [--reveal] [--no-early-stop] ──
+	const clampDebateRounds = (n: number): number => Number.isFinite(n) ? Math.max(1, Math.min(5, Math.floor(n))) : 2;
+	pi.registerCommand("debate", {
+		description: "Multi-round debate: ARCHITECT-side and BUILDER-side debaters argue, then a JUDGE renders the verdict — /debate <prompt> [--rounds N] [--reveal] [--no-early-stop]",
+		handler: async (raw, ctx) => {
+			const { rest, skip } = stripCastDefaults(raw);
+			let input = (rest ?? "").trim();
+			let maxRounds = 2, reveal = false, noEarlyStop = false;
+			input = input.replace(/--rounds[=\s]+(\d+)\s*/g, (_m, n) => { maxRounds = clampDebateRounds(Number.parseInt(n, 10)); return ""; })
+				.replace(/--reveal\s*/g, () => { reveal = true; return ""; })
+				.replace(/--no-early-stop\s*/g, () => { noEarlyStop = true; return ""; }).trim();
+			if (!input) { ctx.ui.notify("Usage: /debate <prompt> [--rounds N] [--reveal] [--no-early-stop]", "warning"); return; }
+			const prompt = input;
+			if (!(await runCastGate(ctx, "debate", skip))) return;
+			const aModel = castModel("DEBATER_A"), bModel = castModel("DEBATER_B"), jModel = castModel("JUDGE");
+			const startedAt = Date.now();
+			const artifactsDir = await mkArtifacts();
+			await save(artifactsDir, "prompt.md", prompt);
+			panel({ kind: "prompt", command: "debate", ok: true }, `/debate ${(raw ?? "").trim()}`);
+			panel({ kind: "banner", command: "debate", ok: true, prompt, roles: [{ role: "DEBATER_A", model: aModel }, { role: "DEBATER_B", model: bModel }, { role: "JUDGE", model: jModel }], artifactsDir, maxRounds }, "");
+			const debaterA = newRun("DEBATER_A", aModel), debaterB = newRun("DEBATER_B", bModel);
+			const stopper = startStoppable(ctx, "debate");
+			const stopWidget = startWidget(ctx, "debate", [debaterA, debaterB], undefined, startedAt);
+			const aSess = roleSession("architect", ctx.cwd), bSess = roleSession("builder", ctx.cwd);
+			const opening = (role: Role, model: string): string => fill("USER_PROMPT_DEBATE_OPENING.md", { ROLE: role, MODEL: model, PROMPT: prompt });
+			const rebuttal = (role: Role, model: string, round: number, opp: string): string => fill("USER_PROMPT_DEBATE_REBUTTAL.md", { ROLE: role, MODEL: model, ROUND: String(round), OPPONENT_ANSWER: truncateChars(opp, HANDOFF_MAX) });
+			try {
+				ctx.ui.setStatus(CUSTOM_TYPE, `debate: round 1/${maxRounds} — openings…`);
+				// Round 1: parallel openings
+				await Promise.all([
+					runChild({ run: debaterA, prompt: opening("DEBATER_A", aModel), tools: OPINION_TOOLS, thinking: castThinking("DEBATER_A"), sessionDir: aSess.dir, sessionId: aSess.id, cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal }),
+					runChild({ run: debaterB, prompt: opening("DEBATER_B", bModel), tools: OPINION_TOOLS, thinking: castThinking("DEBATER_B"), ...builderSpawn(ctx, artifactsDir), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal }),
+				]);
+				if (stopper.stopped()) { stoppedPanel("debate", [debaterA, debaterB], artifactsDir, startedAt, "Stopped during round 1 openings."); return; }
+				if (!runOk(debaterA) || !runOk(debaterB)) {
+					panel({ kind: "error", command: "debate", ok: false, sources: [toStat(debaterA), toStat(debaterB)], artifactsDir }, `Debate aborted: one or both debaters failed in round 1.`);
+					return;
+				}
+				await save(artifactsDir, "debater_a_r1.md", debaterA.text); await save(artifactsDir, "debater_b_r1.md", debaterB.text);
+				// Rounds 2..N: rebuttals resume pinned sessions
+				for (let round = 2; round <= maxRounds; round++) {
+					ctx.ui.setStatus(CUSTOM_TYPE, `debate: round ${round}/${maxRounds} — rebuttals…`);
+					const aOpp = debaterB.text, bOpp = debaterA.text;
+					await Promise.all([
+						runChild({ run: debaterA, prompt: rebuttal("DEBATER_A", aModel, round, aOpp), tools: OPINION_TOOLS, thinking: castThinking("DEBATER_A"), sessionDir: aSess.dir, sessionId: aSess.id, cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal }),
+						runChild({ run: debaterB, prompt: rebuttal("DEBATER_B", bModel, round, bOpp), tools: OPINION_TOOLS, thinking: castThinking("DEBATER_B"), ...builderSpawn(ctx, artifactsDir), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal }),
+					]);
+					if (stopper.stopped()) { stoppedPanel("debate", [debaterA, debaterB], artifactsDir, startedAt, `Stopped during round ${round}/${maxRounds} rebuttals.`); return; }
+					await save(artifactsDir, `debater_a_r${round}.md`, debaterA.text); await save(artifactsDir, `debater_b_r${round}.md`, debaterB.text);
+					// Convergence check (unless --no-early-stop), after each rebuttal round except the last
+					if (!noEarlyStop && round < maxRounds) {
+						ctx.ui.setStatus(CUSTOM_TYPE, `debate: round ${round}/${maxRounds} — convergence check…`);
+						const conv = newRun("JUDGE", jModel);
+						await runChild({ run: conv, prompt: fill("USER_PROMPT_DEBATE_CONVERGENCE.md", { ANSWER_A: truncateChars(debaterA.text, HANDOFF_MAX), ANSWER_B: truncateChars(debaterB.text, HANDOFF_MAX) }), tools: READONLY_TOOLS, thinking: castThinking("JUDGE"), ...ephemeralSpawn(artifactsDir, `convergence-r${round}`), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal });
+						if (stopper.stopped()) { stoppedPanel("debate", [debaterA, debaterB], artifactsDir, startedAt, `Stopped at convergence check after round ${round}.`); return; }
+						const lastLine = conv.text.trim().split("\n").pop()?.trim() ?? "";
+						if (/^converged[\s—]/i.test(lastLine) || /^converged$/i.test(lastLine)) { maxRounds = round; break; }
+					}
+				}
+				// JUDGE: fresh ephemeral, anonymized transcript
+				const aLabel = reveal ? `Debater A (${aModel})` : "Debater A", bLabel = reveal ? `Debater B (${bModel})` : "Debater B";
+				const stripModel = (text: string): string => { if (reveal) return text; let t = text; for (const m of [aModel, bModel]) for (const p of m.split("/")) if (p && p.length > 3) t = t.replace(new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[model]"); return t; };
+				const tp: string[] = [];
+				for (let r = 1; r <= maxRounds; r++) {
+					const af = await fs.promises.readFile(path.join(artifactsDir, `debater_a_r${r}.md`), "utf-8").catch(() => debaterA.text);
+					const bf = await fs.promises.readFile(path.join(artifactsDir, `debater_b_r${r}.md`), "utf-8").catch(() => debaterB.text);
+					tp.push(`--- Round ${r} ---`, `${aLabel}:\n${stripModel(af)}`, `${bLabel}:\n${stripModel(bf)}`);
+				}
+				const transcript = tp.join("\n\n"); await save(artifactsDir, "transcript.md", transcript);
+				ctx.ui.setStatus(CUSTOM_TYPE, "debate: judge rendering verdict…");
+				const judge = newRun("JUDGE", jModel);
+				await runChild({ run: judge, prompt: fill("USER_PROMPT_DEBATE_JUDGE.md", { DEBATER_A_LABEL: aLabel, DEBATER_B_LABEL: bLabel, PROMPT: prompt, TRANSCRIPT: transcript }), tools: READONLY_TOOLS, thinking: castThinking("JUDGE"), ...ephemeralSpawn(artifactsDir, "judge"), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal });
+				await save(artifactsDir, "verdict.md", runOk(judge) ? judge.text : `FAILED: ${runError(judge)}`);
+				const allRuns = [debaterA, debaterB, judge]; const t = totals(allRuns, startedAt); const ok = runOk(judge);
+				panel({ kind: "verdict", command: "debate", ok, agent: toStat(judge), sources: [toStat(debaterA), toStat(debaterB)], artifactsDir, ...t }, [`## Debate: ${prompt.slice(0, 100)}`, ``, `**Rounds:** ${maxRounds}${reveal ? " · identities revealed" : " · anonymized"}`, ``, `### ${aLabel}`, debaterA.text, ``, `### ${bLabel}`, debaterB.text, ``, `### JUDGE VERDICT`, ok ? judge.text : `JUDGE failed: ${runError(judge)}`].join("\n"));
+				await save(artifactsDir, "summary.json", JSON.stringify({ command: "debate", ok, rounds: maxRounds, reveal, noEarlyStop, agents: allRuns.map(toStat), sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t }, null, 2));
+			} finally { stopper.release(); stopWidget(); ctx.ui.setStatus(CUSTOM_TYPE, undefined); }
+		},
+	});
+
+	// ── 8.16 /coordinate <prompt> [--no-fix-up] ──
+	interface SubtaskEntry { id: string; title?: string; prompt?: string; paths?: string[]; dependsOn?: string[]; }
+	interface SubtaskManifest { subtasks?: SubtaskEntry[]; }
+	const validateManifest = (data: any): { ok: true; manifest: SubtaskManifest } | { ok: false; error: string } => {
+		if (!data || typeof data !== "object") return { ok: false, error: "manifest is not a JSON object" };
+		const m = data as SubtaskManifest;
+		if (!Array.isArray(m.subtasks) || m.subtasks.length === 0) return { ok: false, error: "manifest.subtasks must be a non-empty array" };
+		const ids = new Set<string>();
+		for (let i = 0; i < m.subtasks.length; i++) {
+			const s = m.subtasks[i]!;
+			if (!s.id || typeof s.id !== "string") return { ok: false, error: `subtasks[${i}]: missing or invalid 'id'` };
+			if (ids.has(s.id)) return { ok: false, error: `subtasks[${i}]: duplicate id '${s.id}'` };
+			ids.add(s.id);
+			if (!s.prompt || typeof s.prompt !== "string") return { ok: false, error: `subtasks[${i}] (${s.id}): missing 'prompt'` };
+			if (!Array.isArray(s.paths) || s.paths.length === 0) return { ok: false, error: `subtasks[${i}] (${s.id}): 'paths' must be a non-empty array` };
+			if (!Array.isArray(s.dependsOn)) s.dependsOn = [];
+		}
+		return { ok: true, manifest: m };
+	};
+	const topoLevels = (subtasks: SubtaskEntry[]): { levels: SubtaskEntry[][]; error?: string } => {
+		const byId = new Map(subtasks.map((s) => [s.id, s]));
+		const inDeg = new Map<string, number>(), deps = new Map<string, string[]>();
+		for (const s of subtasks) { inDeg.set(s.id, 0); deps.set(s.id, []); }
+		for (const s of subtasks) for (const dep of s.dependsOn ?? []) {
+			if (!byId.has(dep)) return { levels: [], error: `subtask '${s.id}' depends on unknown '${dep}'` };
+			deps.get(dep)!.push(s.id); inDeg.set(s.id, (inDeg.get(s.id) ?? 0) + 1);
+		}
+		const queue: string[] = [];
+		for (const [id, d] of inDeg) if (d === 0) queue.push(id);
+		const levels: SubtaskEntry[][] = []; let visited = 0;
+		while (queue.length) {
+			const batch = [...queue]; queue.length = 0; const level: SubtaskEntry[] = [];
+			for (const id of batch) { level.push(byId.get(id)!); visited++; for (const nx of deps.get(id) ?? []) { const d = (inDeg.get(nx) ?? 1) - 1; inDeg.set(nx, d); if (d === 0) queue.push(nx); } }
+			levels.push(level);
+		}
+		if (visited !== subtasks.length) return { levels: [], error: "circular dependency detected" };
+		return { levels };
+	};
+	pi.registerCommand("coordinate", {
+		description: "Orchestrate subtasks: COORDINATOR decomposes, workers execute in dependency order, COORDINATOR integrates — /coordinate <prompt> [--no-fix-up]",
+		handler: async (raw, ctx) => {
+			const { rest, skip } = stripCastDefaults(raw);
+			let input = (rest ?? "").trim(), noFixUp = false;
+			input = input.replace(/--no-fix-up\s*/g, () => { noFixUp = true; return ""; }).trim();
+			if (!input) { ctx.ui.notify("Usage: /coordinate [--no-fix-up] <prompt>", "warning"); return; }
+			const prompt = input;
+			if (!(await runCastGate(ctx, "coordinate", skip))) return;
+			const cModel = castModel("COORDINATOR");
+			const startedAt = Date.now();
+			const artifactsDir = await mkArtifacts();
+			const subtasksPath = path.join(artifactsDir, "subtasks.json");
+			await save(artifactsDir, "prompt.md", prompt);
+			panel({ kind: "prompt", command: "coordinate", ok: true }, `/coordinate ${(raw ?? "").trim()}`);
+			panel({ kind: "banner", command: "coordinate", ok: true, prompt, roles: [{ role: "COORDINATOR", model: cModel }], artifactsDir }, "");
+			const coordinator = newRun("COORDINATOR", cModel);
+			const stopper = startStoppable(ctx, "coordinate");
+			const stopWidget = startWidget(ctx, "coordinate", [coordinator], undefined, startedAt);
+			try {
+				// Stage 1: decompose
+				ctx.ui.setStatus(CUSTOM_TYPE, "coordinate: coordinator decomposing…");
+				await runChild({ run: coordinator, prompt: fill("USER_PROMPT_COORDINATOR.md", { MODEL: cModel, SUBTASKS_PATH: subtasksPath, PROMPT: prompt }), tools: VALIDATOR_TOOLS, thinking: castThinking("COORDINATOR"), sessionDir: roleSession("architect", ctx.cwd).dir, sessionId: roleSession("architect", ctx.cwd).id, cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal });
+				await save(artifactsDir, "coordinator.md", coordinator.text);
+				if (stopper.stopped()) { stoppedPanel("coordinate", [coordinator], artifactsDir, startedAt, "Coordinator was stopped while decomposing."); return; }
+				const manifestRaw = await fs.promises.readFile(subtasksPath, "utf-8").catch(() => undefined);
+				if (!manifestRaw) { panel({ kind: "error", command: "coordinate", ok: false, agent: toStat(coordinator), artifactsDir }, `COORDINATOR did not write subtasks.json to ${subtasksPath}\n\n${coordinator.text}`); return; }
+				let parsed: any; try { parsed = JSON.parse(manifestRaw); } catch (err) { panel({ kind: "error", command: "coordinate", ok: false, agent: toStat(coordinator), artifactsDir }, `subtasks.json is not valid JSON:\n${String(err)}\n\n\`\`\`\n${manifestRaw}\n\`\`\``); return; }
+				const validation = validateManifest(parsed);
+				if (!validation.ok) { panel({ kind: "error", command: "coordinate", ok: false, agent: toStat(coordinator), artifactsDir }, `Invalid manifest: ${validation.error}\n\n\`\`\`json\n${manifestRaw}\n\`\`\``); return; }
+				const { levels, error: topoError } = topoLevels(validation.manifest.subtasks!);
+				if (topoError) { panel({ kind: "error", command: "coordinate", ok: false, agent: toStat(coordinator), artifactsDir }, `Dependency error: ${topoError}`); return; }
+				// Stage 2: level-scheduled workers
+				const workerRuns: Array<{ entry: SubtaskEntry; run: AgentRun }> = [];
+				for (let li = 0; li < levels.length; li++) {
+					ctx.ui.setStatus(CUSTOM_TYPE, `coordinate: level ${li + 1}/${levels.length} — ${levels[li]!.length} worker(s)…`);
+					const lvl = levels[li]!.map((entry) => ({ entry, run: newRun("BUILDER", castModel("BUILDER")) }));
+					await Promise.all(lvl.map(({ entry, run }) => runChild({ run, prompt: fill("USER_PROMPT_COORDINATOR_WORKER.md", { OWNED_PATHS: (entry.paths ?? []).join(", "), TITLE: entry.title ?? entry.id, PROMPT: entry.prompt ?? "" }), tools: FULL_TOOLS, thinking: castThinking("BUILDER"), ...ephemeralSpawn(artifactsDir, `worker-${entry.id}`), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal })));
+					if (stopper.stopped()) { stoppedPanel("coordinate", [coordinator], artifactsDir, startedAt, `Stopped during level ${li + 1}/${levels.length}.`); return; }
+					for (const { entry, run } of lvl) { workerRuns.push({ entry, run }); await save(artifactsDir, `worker-${entry.id}.md`, runOk(run) ? run.text : `FAILED: ${runError(run)}`); }
+				}
+				// Stage 3: integration (+ one fix-up pass)
+				const results = workerRuns.map(({ entry, run }) => `### ${entry.id}: ${entry.title ?? ""}\n${runOk(run) ? "✓ done" : `✗ failed: ${runError(run)}`}\n${truncateChars(run.text, Math.floor(HANDOFF_MAX / workerRuns.length))}`).join("\n\n");
+				ctx.ui.setStatus(CUSTOM_TYPE, "coordinate: coordinator integrating…");
+				await runChild({ run: coordinator, prompt: fill("USER_PROMPT_COORDINATOR_INTEGRATION.md", { MODEL: cModel, PROMPT: prompt, SUBTASK_RESULTS: results, FIXUP_BLOCK: noFixUp ? "" : "\nIf you find gaps, you will get ONE fix-up pass with FULL_TOOLS.", FIXUP_NOTE: "" }), tools: READONLY_TOOLS, thinking: castThinking("COORDINATOR"), sessionDir: roleSession("architect", ctx.cwd).dir, sessionId: roleSession("architect", ctx.cwd).id, cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal });
+				await save(artifactsDir, "integration.md", coordinator.text);
+				let fixupApplied = false;
+				if (!noFixUp && /gap|missing|incomplete|not satisfied/i.test(coordinator.text)) {
+					fixupApplied = true; ctx.ui.setStatus(CUSTOM_TYPE, "coordinate: fix-up pass (gaps found)…");
+					await runChild({ run: coordinator, prompt: fill("USER_PROMPT_COORDINATOR_INTEGRATION.md", { MODEL: cModel, PROMPT: prompt, SUBTASK_RESULTS: results, FIXUP_BLOCK: "", FIXUP_NOTE: `\n# FIX-UP PASS — Address the gaps with FULL_TOOLS, then render the final report.\n${coordinator.text.slice(-2000)}` }), tools: FULL_TOOLS, thinking: castThinking("COORDINATOR"), sessionDir: roleSession("architect", ctx.cwd).dir, sessionId: roleSession("architect", ctx.cwd).id, cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal });
+					await save(artifactsDir, "integration-fixup.md", coordinator.text);
+				}
+				const allRuns = [...workerRuns.map((w) => w.run), coordinator]; const t = totals(allRuns, startedAt); const ok = runOk(coordinator);
+				panel({ kind: "multi", command: "coordinate", ok, sources: [...workerRuns.map(({ run }) => toStat(run)), toStat(coordinator)], answers: [{ role: "COORDINATOR", model: cModel, text: coordinator.text }], artifactsDir, ...t }, [`## Coordinate: ${prompt.slice(0, 100)}`, ``, `**Subtasks:** ${validation.manifest.subtasks!.length} in ${levels.length} levels`, fixupApplied ? `**Fix-up:** applied` : noFixUp ? `**Fix-up:** disabled` : `**Fix-up:** not needed`, ``, ...workerRuns.flatMap(({ entry, run }) => [`### ${entry.id} — ${entry.title ?? ""}`, runOk(run) ? run.text.slice(0, 2000) : `FAILED: ${runError(run)}`, ""]), `### Integration Report`, ok ? coordinator.text : `Coordinator failed: ${runError(coordinator)}`].join("\n"));
+				await save(artifactsDir, "summary.json", JSON.stringify({ command: "coordinate", ok, fixupApplied, noFixUp, agents: allRuns.map(toStat), sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t }, null, 2));
+			} finally { stopper.release(); stopWidget(); ctx.ui.setStatus(CUSTOM_TYPE, undefined); }
+		},
+	});
+
+	// ── 8.17 /council <prompt> ──
+	pi.registerCommand("council", {
+		description: "Multi-model council: panelists answer independently, anonymized ranking, chairman synthesizes — /council <prompt>",
+		handler: async (raw, ctx) => {
+			const { rest, skip } = stripCastDefaults(raw);
+			const prompt = (rest ?? "").trim();
+			if (!prompt) { ctx.ui.notify("Usage: /council <prompt>", "warning"); return; }
+			if (!(await runCastGate(ctx, "council", skip))) return;
+			const panelRaw = cast["PANEL"]?.model ?? castModel("ARCHITECT");
+			const panelModels = panelRaw.split(",").map((s) => s.trim()).filter(Boolean);
+			if (panelModels.length < 2) { ctx.ui.notify("Council requires at least 2 panelists. Use /roles to set PANEL (multi-pick).", "error"); return; }
+			const cModel = castModel("CHAIRMAN");
+			const startedAt = Date.now();
+			const artifactsDir = await mkArtifacts();
+			await save(artifactsDir, "prompt.md", prompt);
+			panel({ kind: "prompt", command: "council", ok: true }, `/council ${prompt}`);
+			panel({ kind: "banner", command: "council", ok: true, prompt, roles: [...panelModels.map((m: string) => ({ role: "PANEL" as Role, model: m })), { role: "CHAIRMAN", model: cModel }], artifactsDir }, "");
+			const panelRuns: AgentRun[] = panelModels.map((m: string) => newRun("PANEL", m));
+			const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+			const stopper = startStoppable(ctx, "council");
+			const stopWidget = startWidget(ctx, "council", panelRuns, undefined, startedAt);
+			try {
+				// Stage 1: parallel answers (fresh ephemeral)
+				ctx.ui.setStatus(CUSTOM_TYPE, `council: stage 1 — ${panelModels.length} panelists answering…`);
+				await Promise.all(panelRuns.map((run) => runChild({ run, prompt: fill("USER_PROMPT_COUNCIL_PANELIST.md", { PROMPT: prompt }), tools: OPINION_TOOLS, thinking: castThinking("PANEL"), ...ephemeralSpawn(artifactsDir, `panelist-${run.model}`), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal })));
+				if (stopper.stopped()) { stoppedPanel("council", panelRuns, artifactsDir, startedAt, "Stopped during stage 1."); return; }
+				const survivors = panelRuns.filter(runOk);
+				if (survivors.length < 2) { panel({ kind: "error", command: "council", ok: false, sources: panelRuns.map(toStat), artifactsDir }, `Council failed: only ${survivors.length} survived (min 2).`); return; }
+				for (let i = 0; i < panelRuns.length; i++) await save(artifactsDir, `panel-answer-${i}.md`, runOk(panelRuns[i]!) ? panelRuns[i]!.text : `FAILED: ${runError(panelRuns[i]!)}`);
+				// Stage 2: anonymize + rank
+				const survivorIdx = panelRuns.map((r, i) => (runOk(r) ? i : -1)).filter((i) => i >= 0);
+				const letterOf = (idx: number) => letters[survivorIdx.indexOf(idx)] ?? "?";
+				const stripModel = (text: string, model: string): string => { let t = text; for (const p of model.split("/")) if (p && p.length > 3) t = t.replace(new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]"); return t; };
+				const answers = survivorIdx.map((idx) => ({ letter: letterOf(idx), text: stripModel(panelRuns[idx]!.text, panelRuns[idx]!.model) }));
+			const answersBlock = answers.map((a) => `### Response ${a.letter}\n${a.text}`).join("\n\n");
+				await save(artifactsDir, "anonymized-answers.md", answersBlock);
+				ctx.ui.setStatus(CUSTOM_TYPE, `council: stage 2 — ranking…`);
+				const rankRuns: AgentRun[] = survivorIdx.map((idx) => newRun("PANEL", panelRuns[idx]!.model));
+				await Promise.all(rankRuns.map((run) => runChild({ run, prompt: fill("USER_PROMPT_COUNCIL_RANKING.md", { PROMPT: prompt, ANSWERS: answersBlock }), tools: OPINION_TOOLS, thinking: castThinking("PANEL"), ...ephemeralSpawn(artifactsDir, `ranking-${run.model}`), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal })));
+				if (stopper.stopped()) { stoppedPanel("council", [...panelRuns, ...rankRuns], artifactsDir, startedAt, "Stopped during stage 2."); return; }
+				// Stage 3: Borda aggregation + chairman
+				ctx.ui.setStatus(CUSTOM_TYPE, "council: stage 3 — aggregating + chairman…");
+				const n = answers.length;
+				const borda = new Map<string, number>();
+				for (const a of answers) borda.set(a.letter, 0);
+				const validLetters = new Set(answers.map((a) => a.letter));
+				const excluded: string[] = [];
+				for (let ri = 0; ri < rankRuns.length; ri++) {
+					const r = rankRuns[ri]!;
+					if (!runOk(r)) { excluded.push(`Panelist ${survivorIdx[ri]}: ranking failed`); continue; }
+					const ranked: string[] = [];
+					for (const line of r.text.split("\n")) { const m = line.trim().match(/^([A-Z])\s*—/); if (m && validLetters.has(m[1]!)) ranked.push(m[1]!); }
+					if (new Set(ranked).size !== n || ranked.length !== n) { excluded.push(`Panelist ${survivorIdx[ri]}: malformed ranking`); continue; }
+					for (let pos = 0; pos < ranked.length; pos++) borda.set(ranked[pos]!, (borda.get(ranked[pos]!) ?? 0) + (n - pos));
+				}
+				const rankingTable = [...borda.entries()].sort((a, b) => b[1] - a[1]).map(([l, s], i) => `${i + 1}. Response ${l} — ${s} pts`).join("\n");
+				const exclNote = excluded.length ? `\n\n**Excluded:**\n${excluded.join("\n")}` : "";
+				const chairman = newRun("CHAIRMAN", cModel);
+				await runChild({ run: chairman, prompt: fill("USER_PROMPT_COUNCIL_CHAIRMAN.md", { PROMPT: prompt, ANSWERS: answersBlock, RANKING_TABLE: rankingTable + exclNote }), tools: READONLY_TOOLS, thinking: castThinking("CHAIRMAN"), ...ephemeralSpawn(artifactsDir, "chairman"), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal });
+				await save(artifactsDir, "chairman.md", runOk(chairman) ? chairman.text : `FAILED: ${runError(chairman)}`);
+				const allRuns = [...panelRuns, ...rankRuns, chairman]; const t = totals(allRuns, startedAt); const ok = runOk(chairman);
+				panel({ kind: "council", command: "council", ok, sources: [...panelRuns.map(toStat), toStat(chairman)], artifactsDir, ...t }, [`## Council: ${prompt.slice(0, 100)}`, ``, `**Panel:** ${panelModels.length} (${survivors.length} survived) · **Chairman:** ${cModel}`, ``, `### Panel Answers`, answersBlock, ``, `### Aggregate Ranking (Borda)`, rankingTable, exclNote, ``, `### Chairman Synthesis`, ok ? chairman.text : `Chairman failed: ${runError(chairman)}`].join("\n"));
+				await save(artifactsDir, "summary.json", JSON.stringify({ command: "council", ok, panelModels, survivors: survivors.length, chairman: cModel, agents: allRuns.map(toStat), sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t }, null, 2));
+			} finally { stopper.release(); stopWidget(); ctx.ui.setStatus(CUSTOM_TYPE, undefined); }
+		},
+	});
+
+	// ── 8.18 /redteam <prompt> [--rounds N] ──
+	const clampRedteamRounds = (n: number): number => Number.isFinite(n) ? Math.max(1, Math.min(8, Math.floor(n))) : 3;
+	pi.registerCommand("redteam", {
+		description: "Adversarial build/attack loop: BUILDER builds, ATTACKER probes — /redteam <prompt> [--rounds N]",
+		handler: async (raw, ctx) => {
+			const { rest, skip } = stripCastDefaults(raw);
+			let input = (rest ?? "").trim(), rounds = 3;
+			input = input.replace(/--rounds[=\s]+(\d+)\s*/g, (_m, n) => { rounds = clampRedteamRounds(Number.parseInt(n, 10)); return ""; }).trim();
+			if (!input) { ctx.ui.notify("Usage: /redteam [--rounds N] <prompt>", "warning"); return; }
+			const prompt = input;
+			if (!(await runCastGate(ctx, "redteam", skip))) return;
+			const bModel = castModel("BUILDER"), aModel = castModel("ATTACKER");
+			const startedAt = Date.now();
+			const artifactsDir = await mkArtifacts();
+			await save(artifactsDir, "prompt.md", prompt);
+			panel({ kind: "prompt", command: "redteam", ok: true }, `/redteam ${(raw ?? "").trim()}`);
+			panel({ kind: "banner", command: "redteam", ok: true, prompt, roles: [{ role: "ATTACKER", model: aModel }, { role: "BUILDER", model: bModel }], artifactsDir, maxRounds: rounds }, "");
+			const builder = newRun("BUILDER", bModel), attacker = newRun("ATTACKER", aModel);
+			const stopper = startStoppable(ctx, "redteam");
+			const stopWidget = startWidget(ctx, "redteam", [attacker, builder], undefined, startedAt);
+			const firstSpawn = builderSpawn(ctx, artifactsDir);
+			try {
+				// Build stage
+				ctx.ui.setStatus(CUSTOM_TYPE, "redteam: builder building…");
+				await runChild({ run: builder, prompt: fill("USER_PROMPT_REDTEAM_BUILDER.md", { PROMPT: prompt, ROUND: "1", NOTE: "" }), systemPrompt: roleSystemPrompt("builder"), tools: FULL_TOOLS, thinking: castThinking("BUILDER"), ...firstSpawn, cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal });
+				await save(artifactsDir, "builder-round-1.md", runOk(builder) ? builder.text : `FAILED: ${runError(builder)}`);
+				if (stopper.stopped()) { stoppedPanel("redteam", [attacker, builder], artifactsDir, startedAt, "Stopped during the initial build."); return; }
+				if (!runOk(builder)) { panel({ kind: "error", command: "redteam", ok: false, sources: [toStat(builder)], artifactsDir }, `Builder failed: ${runError(builder)}`); return; }
+				// Sortie loop
+				let lastBreach = "", finalConcede = false, verdictMissed = false;
+				for (let round = 1; round <= rounds; round++) {
+					ctx.ui.setStatus(CUSTOM_TYPE, `redteam: sortie ${round}/${rounds} — attacker probing…`);
+					await runChild({ run: attacker, prompt: fill("USER_PROMPT_REDTEAM_ATTACKER.md", { PROMPT: prompt, ROUND: String(round), MAX_ROUNDS: String(rounds), BREACH_NOTE: lastBreach ? `\nPrevious breach: ${lastBreach.slice(0, 2000)}` : "" }), tools: OPINION_TOOLS, thinking: castThinking("ATTACKER"), sessionDir: roleSession("architect", ctx.cwd).dir, sessionId: roleSession("architect", ctx.cwd).id, cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal });
+					await save(artifactsDir, `attacker-round-${round}.md`, runOk(attacker) ? attacker.text : `FAILED: ${runError(attacker)}`);
+					if (stopper.stopped()) { stoppedPanel("redteam", [attacker, builder], artifactsDir, startedAt, `Stopped during sortie ${round}.`); return; }
+					const verdict = parseStrictVerdictLine(attacker.text, "VERDICT");
+					if (!verdict) {
+						if (verdictMissed) { panel({ kind: "error", command: "redteam", ok: false, sources: [toStat(attacker), toStat(builder)], artifactsDir }, `✗ HALTED — Attacker missed VERDICT line twice.\n\n\`\`\`\n${truncateChars(attacker.text, DETAIL_SNIPPET_MAX)}\n\`\`\``); return; }
+						verdictMissed = true; round--; continue;
+					}
+					verdictMissed = false;
+					if (verdict.toUpperCase() === "CONCEDE") { finalConcede = true; break; }
+					// BREACH: patch the builder
+					lastBreach = truncateChars(attacker.text, HANDOFF_MAX);
+					ctx.ui.setStatus(CUSTOM_TYPE, `redteam: sortie ${round}/${rounds} — BREACH, builder patching…`);
+					await runChild({ run: builder, prompt: fill("USER_PROMPT_REDTEAM_BUILDER.md", { PROMPT: prompt, ROUND: String(round + 1), NOTE: `\n# BREACH REPORT (sortie ${round}) — Address this:\n${lastBreach}` }), systemPrompt: roleSystemPrompt("builder"), tools: FULL_TOOLS, thinking: castThinking("BUILDER"), ...(builder.sessionRef ? { sessionDir: firstSpawn.sessionDir, resume: builder.sessionRef } : firstSpawn), cwd: ctx.cwd, timeoutMs: buildTimeoutMs(), signal: stopper.signal });
+					await save(artifactsDir, `builder-round-${round + 1}.md`, runOk(builder) ? builder.text : `FAILED: ${runError(builder)}`);
+					if (stopper.stopped()) { stoppedPanel("redteam", [attacker, builder], artifactsDir, startedAt, `Stopped during builder patch after sortie ${round}.`); return; }
+				}
+				const allRuns = [builder, attacker]; const t = totals(allRuns, startedAt); const ok = finalConcede;
+				panel({ kind: "redteam", command: "redteam", ok, sources: [toStat(attacker), toStat(builder)], artifactsDir, ...t }, [`## Redteam: ${prompt.slice(0, 100)}`, ``, `**Sorties:** ${rounds}${finalConcede ? " (CONCEDE)" : " (BREACH at cap)"}`, ``, `### Builder Report`, runOk(builder) ? builder.text : `FAILED: ${runError(builder)}`, ``, `### Attacker Report`, runOk(attacker) ? attacker.text : `FAILED: ${runError(attacker)}`, ``, `## Final Verdict`, finalConcede ? `✓ CONCEDE — attack surface secure after ${rounds} sorties.` : `✗ CAP REACHED — last verdict: BREACH after ${rounds}/${rounds} sorties.\n\n**Last breach:**\n${truncateChars(lastBreach, DETAIL_SNIPPET_MAX)}`].join("\n"));
+				await save(artifactsDir, "summary.json", JSON.stringify({ command: "redteam", ok: finalConcede, rounds, agents: allRuns.map(toStat), sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t }, null, 2));
+			} finally { stopper.release(); stopWidget(); ctx.ui.setStatus(CUSTOM_TYPE, undefined); }
+		},
+	});
+
+	// ── 8.19 /opinion <prompt> ─────────────────────────────────
 	pi.registerCommand("opinion", {
 		description: "Both models answer independently — side-by-side two-column panel (model · latency · tokens · cost). No fusion.",
 		handler: async (raw, ctx) => {
