@@ -12,9 +12,19 @@ A standalone [Pi coding agent](https://github.com/badlogic/pi-mono) extension fo
 
 ```bash
 npm install -g @earendil-works/pi-coding-agent
-brew install just jq uv
-printf 'ANTHROPIC_API_KEY=sk-ant-...\nOPENAI_API_KEY=sk-...\n' >> .env
-just fh-workhorse
+brew install just jq uv   # or: winget install Casey.Just jqlang.jq astral-sh.uv
+printf 'OPENCODE_API_KEY=...\n' >> .env
+just fh
+```
+
+Default cast (`just fh`) is DeepSeek via OpenCode Go at max thinking:
+
+```bash
+pi -e extensions/fusion-harness/fusion-harness.ts \
+  --model opencode-go/deepseek-v4-flash \
+  --architect opencode-go/deepseek-v4-pro \
+  --builder opencode-go/deepseek-v4-flash \
+  --architect-thinking max --builder-thinking max
 ```
 
 ---
@@ -97,6 +107,7 @@ Every role can hold any model from any registered provider. The cast sheet opens
 ### Recipes
 
 ```
+just fh                 # default: opencode-go deepseek-v4-pro + deepseek-v4-flash (max thinking)
 just fh-workhorse       # WORKHORSE tier (testing)
 just fh-sota            # STATE-OF-THE-ART tier
 just fh-glm             # zai/glm-5.2 + zai/glm-5-turbo
@@ -109,10 +120,10 @@ just fh ARCH=zai/glm-5.2 BUILDER=openai/gpt-5.6-sol
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--architect <provider/id>` | `anthropic/claude-fable-5` | Plans / fuses / validates |
-| `--builder <provider/id>` | `openai/gpt-5.6-sol` | Builds |
-| `--architect-thinking <level>` | `medium` | Thinking for all architect-family agents |
-| `--builder-thinking <level>` | `medium` | Thinking for all builder agents |
+| `--architect <provider/id>` | `opencode-go/deepseek-v4-pro` | Plans / fuses / validates |
+| `--builder <provider/id>` | `opencode-go/deepseek-v4-flash` | Builds |
+| `--architect-thinking <level>` | `max` | Thinking for all architect-family agents |
+| `--builder-thinking <level>` | `max` | Thinking for all builder agents |
 | `--architect-system-prompt <text\|path>` | pi default | System prompt for architect workers |
 | `--builder-system-prompt <text\|path>` | pi default | System prompt for all builder agents |
 | `--max-validations <n>` | `5` | Gate validations before halting |

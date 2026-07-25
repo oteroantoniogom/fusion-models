@@ -123,6 +123,16 @@ const KNOWN_ROLES: readonly string[] = [
 	"ATTACKER",
 ];
 
+/** Roles whose cast.model is a comma-separated multi-pick list (e.g. PANEL). */
+const MULTI_PICK_ROLES: readonly Role[] = ["PANEL"];
+
+/** Expand a cast model string into one or more provider/id entries. */
+const expandCastModels = (role: Role | string, raw: string): string[] => {
+	const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+	if (MULTI_PICK_ROLES.includes(role as Role)) return parts;
+	return parts.length ? [raw.trim()] : [];
+};
+
 /** Which side a role belongs to — every role inherits its side's default model. */
 const ROLE_SIDE: Record<string, Side> = {
 	ARCHITECT: "architect",
@@ -2177,6 +2187,13 @@ class CastSheet implements Component {
 
 	private handleDrill(data: string) {
 		if (matchesKey(data, "return")) {
+			// Multi-pick: Enter confirms selection and returns to rows (Space toggles).
+			// Single-pick: Enter assigns the highlighted model and returns.
+			if (this.multiPick.includes(this.drillRole)) {
+				this.mode = "rows";
+				this.rerender();
+				return;
+			}
 			const list = this.filteredItems();
 			const it = list[this.drillIndex];
 			if (it) this.pick(it.model);
@@ -2279,7 +2296,15 @@ class CastSheet implements Component {
 		this.roles.forEach((role, i) => {
 			const sel = i === this.cursor ? "▸ " : "  ";
 			const auth = this.authMarker(role);
-			const model = truncateToWidth(this.roleModel(role), 44);
+			const rawModel = this.roleModel(role);
+			const multi = this.multiPick.includes(role);
+			const modelLabel = multi
+				? (() => {
+						const n = rawModel.split(",").map((s) => s.trim()).filter(Boolean).length;
+						return n > 1 ? `${n} models: ${rawModel}` : rawModel;
+					})()
+				: rawModel;
+			const model = truncateToWidth(modelLabel, 44);
 			const th = truncateToWidth(this.roleThinkingDisplay(role), 10);
 			const name = truncateToWidth(`${ROLE_GLYPH[role]} ${role}`.padEnd(12), 12);
 			lines.push(`${sel}${name} ${model.padEnd(44)} ${th.padEnd(10)} ${auth}`);
@@ -2298,8 +2323,14 @@ class CastSheet implements Component {
 		const innerW = Math.max(40, Math.min(width - 2, 92));
 		const list = this.filteredItems();
 		const multi = this.multiPick.includes(this.drillRole);
+		const picked = multi ? this.curMultiSet().size : 0;
 		const lines: string[] = [
-			themelessHeader(`${ROLE_GLYPH[this.drillRole]} ${this.drillRole} · pick a model`, innerW),
+			themelessHeader(
+				multi
+					? `${ROLE_GLYPH[this.drillRole]} ${this.drillRole} · multi-pick (${picked} selected)`
+					: `${ROLE_GLYPH[this.drillRole]} ${this.drillRole} · pick a model`,
+				innerW,
+			),
 			`  filter: ${this.filter}${this.filter ? "_" : ""}   (${list.length} match${list.length === 1 ? "" : "s"}${multi ? " · space toggles · ⏎ done" : " · ⏎ select"})`,
 			`  ${"─".repeat(innerW - 2)}`,
 		];
@@ -2315,7 +2346,9 @@ class CastSheet implements Component {
 		});
 		for (let i = visible.length; i < this.maxListRows; i++) lines.push("");
 		lines.push(`  ${"─".repeat(innerW - 2)}`);
-		lines.push("  type to filter · ↑↓ move · ⏎ select · ⌫ back · Esc cancel");
+		lines.push(multi
+			? "  type to filter · ↑↓ move · space toggle · ⏎ done · ⌫ back · Esc cancel"
+			: "  type to filter · ↑↓ move · ⏎ select · ⌫ back · Esc cancel");
 		return borderBox(lines, innerW);
 	}
 
@@ -2336,12 +2369,23 @@ class CastSheet implements Component {
 	/** Auth marker for a row: ✓ authed, ✗ missing, ? unknown (registry absent). */
 	private authMarker(role: Role): string {
 		try {
-			const model = this.roleModel(role);
-			const { provider, id } = { provider: model.slice(0, model.indexOf("/")), id: model.slice(model.indexOf("/") + 1) };
-			if (!provider || !id || model.indexOf("/") < 0) return "?";
-			const found = this.reg?.find?.(provider, id);
-			if (!found) return "✗";
-			return this.reg?.hasConfiguredAuth?.(found) ? "✓" : "✗";
+			const models = expandCastModels(role, this.roleModel(role));
+			if (!models.length) return "?";
+			let anyUnknown = false;
+			for (const model of models) {
+				const slash = model.indexOf("/");
+				if (slash < 1) return "✗";
+				const provider = model.slice(0, slash);
+				const id = model.slice(slash + 1);
+				if (!provider || !id) return "✗";
+				const found = this.reg?.find?.(provider, id);
+				if (!found) {
+					anyUnknown = true;
+					continue;
+				}
+				if (!(this.reg?.hasConfiguredAuth?.(found) ?? true)) return "✗";
+			}
+			return anyUnknown ? "✗" : "✓";
 		} catch {
 			return "?";
 		}
@@ -3294,29 +3338,35 @@ export default function (pi: ExtensionAPI) {
 			catalogError = undefined;
 		}
 		for (const role of roles) {
-			const model = castModel(role);
-			const { provider, id } = splitModel(model);
-			if (!provider || !id) {
-				failures.push({ role, model, kind: "unresolved", provider, id });
+			const models = expandCastModels(role, castModel(role));
+			if (!models.length) {
+				failures.push({ role, model: "", kind: "unresolved", provider: "", id: "" });
 				continue;
 			}
-			let found: any;
-			try {
-				found = ctx.modelRegistry?.find?.(provider, id);
-			} catch {
-				found = undefined;
+			for (const model of models) {
+				const { provider, id } = splitModel(model);
+				if (!provider || !id) {
+					failures.push({ role, model, kind: "unresolved", provider, id });
+					continue;
+				}
+				let found: any;
+				try {
+					found = ctx.modelRegistry?.find?.(provider, id);
+				} catch {
+					found = undefined;
+				}
+				if (!found) {
+					failures.push({ role, model, kind: "unresolved", provider, id });
+					continue;
+				}
+				let authed = true;
+				try {
+					authed = ctx.modelRegistry?.hasConfiguredAuth?.(found) ?? true;
+				} catch {
+					authed = true;
+				}
+				if (!authed) failures.push({ role, model, kind: "no-auth", provider, id });
 			}
-			if (!found) {
-				failures.push({ role, model, kind: "unresolved", provider, id });
-				continue;
-			}
-			let authed = true;
-			try {
-				authed = ctx.modelRegistry?.hasConfiguredAuth?.(found) ?? true;
-			} catch {
-				authed = true;
-			}
-			if (!authed) failures.push({ role, model, kind: "no-auth", provider, id });
 		}
 		return { failures, catalogError };
 	};
@@ -3423,7 +3473,10 @@ export default function (pi: ExtensionAPI) {
 	const runCastGate = async (ctx: any, command: string, skip: boolean): Promise<boolean> => {
 		const roles = COMMAND_CAST[command] ?? KNOWN_ROLES;
 		if (!skip && ctx.hasUI && ctx.mode === "tui") {
-			if ((await openCastSheet(ctx, roles, { command })) !== "run") return false;
+			const multiPick = roles.some((r) => MULTI_PICK_ROLES.includes(r))
+				? ([...MULTI_PICK_ROLES] as Role[])
+				: [];
+			if ((await openCastSheet(ctx, roles, { command, multiPick })) !== "run") return false;
 		}
 		return preflightOrFail(roles, ctx, command);
 	};
@@ -3508,7 +3561,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Open the cast sheet to review or set the session cast (models + thinking per role), then print it",
 		handler: async (_args, ctx) => {
 			if (ctx.hasUI && ctx.mode === "tui") {
-				const r = await openCastSheet(ctx, KNOWN_ROLES, {});
+				const r = await openCastSheet(ctx, KNOWN_ROLES, { multiPick: [...MULTI_PICK_ROLES] });
 				if (r !== "run") return;
 			}
 			seedCast(ctx.cwd);
@@ -4400,8 +4453,7 @@ export default function (pi: ExtensionAPI) {
 			const prompt = (rest ?? "").trim();
 			if (!prompt) { ctx.ui.notify("Usage: /council <prompt>", "warning"); return; }
 			if (!(await runCastGate(ctx, "council", skip))) return;
-			const panelRaw = cast["PANEL"]?.model ?? castModel("ARCHITECT");
-			const panelModels = panelRaw.split(",").map((s) => s.trim()).filter(Boolean);
+			const panelModels = expandCastModels("PANEL", cast["PANEL"]?.model ?? castModel("ARCHITECT"));
 			if (panelModels.length < 2) { ctx.ui.notify("Council requires at least 2 panelists. Use /roles to set PANEL (multi-pick).", "error"); return; }
 			const cModel = castModel("CHAIRMAN");
 			const startedAt = Date.now();
@@ -4992,8 +5044,7 @@ export default function (pi: ExtensionAPI) {
 						stage.artifacts["plan.md"] = path.join(dir, "plan.md");
 					} else {
 						// Council pipeline
-						const panelRaw = cast["PANEL"]?.model ?? castModel("ARCHITECT");
-						const panelModels = panelRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
+						const panelModels = expandCastModels("PANEL", cast["PANEL"]?.model ?? castModel("ARCHITECT"));
 						const cModel = castModel("CHAIRMAN");
 						const { synthesis } = await councilPipeline({
 							prompt,

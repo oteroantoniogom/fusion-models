@@ -4,12 +4,11 @@ set dotenv-load := true
 # /fusion · /auto-validate · /opinion — fuse two frontier models (AND, not OR).
 # The HOST runs on the BUILDER model: raw (non-slash) input IS the builder agent.
 #
-# Generic casted launch:
-#   just fh ARCH=<model> BUILDER=<model>    — with the cast picker at invocation
-#     e.g. just fh ARCH=zai/glm-5.2 BUILDER=opencode/<model>
+# Default launch:
+#   just fh              — DeepSeek via opencode-go (pro plans · flash builds + hosts), thinking max
+#   just fh ARCH=<m> BUILDER=<m>   — override cast, keep max thinking
 #
-# Two launch recipes, two tiers — everything else is a flag:
-#
+# Other tiers:
 #   just fh-workhorse    cheap pair (sonnet-5 plans · terra builds + hosts) — use for testing
 #   just fh-sota         frontier pair (fable-5 plans · sol builds + hosts) — the on-camera run
 #   just fh-glm          multi-provider: zai/glm-5.2 plans · zai/glm-5-turbo builds
@@ -27,12 +26,16 @@ set dotenv-load := true
 #   --escalate-to-validator-count <n>      validator triage from Nth failure  default 3
 #   --child-timeout <seconds>              kill any child agent after N sec   default 28800 = 8h (max 86400)
 #
-# e.g. just fh-workhorse --architect-thinking high --builder-system-prompt ./persona.md
+# e.g. just fh --cast-defaults
+#      just fh-workhorse --architect-thinking high --builder-system-prompt ./persona.md
 #      just fh-sota --architect-thinking max --builder-thinking max
-#      just fh-glm --cast-defaults  (skip the cast picker)
 #
 # Default prompts live in extensions/fusion-harness/{SYSTEM,USER}_PROMPT_*.md — edit to tune.
 # Sessions persist per project (/tmp/fusion-harness-sessions) — /fh-reset for fresh memories.
+
+# Default cast — DeepSeek via OpenCode Go (pro plans · flash builds + hosts). Requires OPENCODE_API_KEY.
+ARCH := "opencode-go/deepseek-v4-pro"
+BUILDER := "opencode-go/deepseek-v4-flash"
 
 # WORKHORSE tier — the cheap pair (sonnet-5 plans · terra builds + hosts). Use for testing.
 WORKHORSE_ARCHITECT := "anthropic/claude-sonnet-5"
@@ -86,9 +89,11 @@ fh-zen *ARGS:
         --architect-thinking medium --builder-thinking medium \
         {{ARGS}}
 
-# Generic casted launch: just fh ARCH=<model> BUILDER=<model> [extra flags]
-fh ARCH BUILDER *ARGS:
+# Default launch — DeepSeek opencode-go pair at max thinking.
+# Override: just fh ARCH=zai/glm-5.2 BUILDER=opencode/<model>
+fh *ARGS:
     pi -e extensions/fusion-harness/fusion-harness.ts \
         --model "{{BUILDER}}" \
         --architect "{{ARCH}}" --builder "{{BUILDER}}" \
+        --architect-thinking max --builder-thinking max \
         {{ARGS}}
