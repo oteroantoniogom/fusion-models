@@ -1,3 +1,8 @@
+# --- Local / session config ---
+.pi/
+.fusion-harness.json
+openspec/
+
 # --- Secrets / env ---
 # .env holds real API keys (ANTHROPIC, SERPAPI, DATAFORSEO, GITHUB_TOKEN, etc.)
 .env
