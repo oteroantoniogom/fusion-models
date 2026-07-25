@@ -558,6 +558,57 @@ class FullWidth {
 	invalidate() {} // pi-tui Component contract — nothing cached to invalidate
 }
 
+/**
+ * Optional hook fired by `runChild` the instant a child run starts working.
+ * Set only by the `/gauntlet` and `/chain` command handlers so the live dashboard
+ * widget can poll the active run's `flow` for a reasoning preview. Undefined for every
+ * other command, so the generic child runner stays a no-op outside a campaign.
+ */
+let gauntletRunHook: ((run: AgentRun) => void) | undefined = undefined;
+
+/** Take the last `max` chars of a thinking block, single-lined, with a leading ellipsis. */
+function snippetTail(text: string, max = 200): string {
+	const t = (text ?? "").replace(/\s+/g, " ").trim();
+	if (!t) return "";
+	return t.length <= max ? t : `…${t.slice(-max)}`;
+}
+
+/**
+ * Newest reasoning across a set of runs — scans most-recent-first, preferring the
+ * in-flight `streamThinking` (live proof of life) before settled `thinking` flow items.
+ * Returns the raw block (caller truncates); undefined when nothing has thought yet.
+ */
+function latestThinking(runs: AgentRun[]): string | undefined {
+	for (let i = runs.length - 1; i >= 0; i--) {
+		const r = runs[i];
+		if (!r) continue;
+		if (r.streamThinking && r.streamThinking.trim()) return r.streamThinking;
+		for (let j = r.flow.length - 1; j >= 0; j--) {
+			const item = r.flow[j];
+			if (item && item.type === "thinking" && item.text.trim()) return item.text;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Gauntlet dashboard — a width-aware Component whose `render(width)` defers to a builder
+ * that picks a tier (full / medium / narrow) from the live terminal width. Same contract
+ * as FullWidth/TwoCol: ask for the width, then fit to it so a 200-col terminal isn't
+ * trimmed to a guess and a 50-col phone doesn't overflow (pi throws on oversize lines).
+ */
+class GauntletDashboard {
+	constructor(private build: (w: number) => string[]) {}
+	render(width: number): string[] {
+		const inner = Math.max(20, width - 2);
+		return fitLines(
+			this.build(inner).map((l) => ` ${l}`),
+			width,
+		);
+	}
+	invalidate() {} // pi-tui Component contract — nothing cached to render
+}
+
 /** Wrap possibly-styled text to a column width, defensively. */
 function wrapCol(text: string, colW: number): string[] {
 	try {
@@ -985,6 +1036,49 @@ async function gateCorrectionLoop(opts: {
 
 // ═══ 5d. Coordinator stage functions (extracted from /coordinate) ═══════════
 
+// ── Subtask manifest types + pure validators (module-level — used by both
+//    top-level coordinator functions AND the closure's /coordinate & /gauntlet
+//    handlers. Defining them inside the closure made them invisible to
+//    coordinatorDecompose, causing `ReferenceError: validateManifest is not defined`
+//    at the DECOMPOSE stage of /gauntlet.) ──
+interface SubtaskEntry { id: string; title?: string; prompt?: string; paths?: string[]; dependsOn?: string[]; }
+interface SubtaskManifest { subtasks?: SubtaskEntry[]; }
+function validateManifest(data: any): { ok: true; manifest: SubtaskManifest } | { ok: false; error: string } {
+	if (!data || typeof data !== "object") return { ok: false, error: "manifest is not a JSON object" };
+	const m = data as SubtaskManifest;
+	if (!Array.isArray(m.subtasks) || m.subtasks.length === 0) return { ok: false, error: "manifest.subtasks must be a non-empty array" };
+	const ids = new Set<string>();
+	for (let i = 0; i < m.subtasks.length; i++) {
+		const s = m.subtasks[i]!;
+		if (!s.id || typeof s.id !== "string") return { ok: false, error: `subtasks[${i}]: missing or invalid 'id'` };
+		if (ids.has(s.id)) return { ok: false, error: `subtasks[${i}]: duplicate id '${s.id}'` };
+		ids.add(s.id);
+		if (!s.prompt || typeof s.prompt !== "string") return { ok: false, error: `subtasks[${i}] (${s.id}): missing 'prompt'` };
+		if (!Array.isArray(s.paths) || s.paths.length === 0) return { ok: false, error: `subtasks[${i}] (${s.id}): 'paths' must be a non-empty array` };
+		if (!Array.isArray(s.dependsOn)) s.dependsOn = [];
+	}
+	return { ok: true, manifest: m };
+}
+function topoLevels(subtasks: SubtaskEntry[]): { levels: SubtaskEntry[][]; error?: string } {
+	const byId = new Map(subtasks.map((s) => [s.id, s]));
+	const inDeg = new Map<string, number>(), deps = new Map<string, string[]>();
+	for (const s of subtasks) { inDeg.set(s.id, 0); deps.set(s.id, []); }
+	for (const s of subtasks) for (const dep of s.dependsOn ?? []) {
+		if (!byId.has(dep)) return { levels: [], error: `subtask '${s.id}' depends on unknown '${dep}'` };
+		deps.get(dep)!.push(s.id); inDeg.set(s.id, (inDeg.get(s.id) ?? 0) + 1);
+	}
+	const queue: string[] = [];
+	for (const [id, d] of inDeg) if (d === 0) queue.push(id);
+	const levels: SubtaskEntry[][] = []; let visited = 0;
+	while (queue.length) {
+		const batch = [...queue]; queue.length = 0; const level: SubtaskEntry[] = [];
+		for (const id of batch) { level.push(byId.get(id)!); visited++; for (const nx of deps.get(id) ?? []) { const d = (inDeg.get(nx) ?? 1) - 1; inDeg.set(nx, d); if (d === 0) queue.push(nx); } }
+		levels.push(level);
+	}
+	if (visited !== subtasks.length) return { levels: [], error: "circular dependency detected" };
+	return { levels };
+}
+
 /** Coordinator stage 1: decompose the prompt into a subtasks.json manifest. */
 async function coordinatorDecompose(opts: {
 	prompt: string;
@@ -1039,14 +1133,15 @@ async function coordinatorDecompose(opts: {
 /** Coordinator stage 2: execute workers in dependency levels (fresh ephemeral). */
 async function coordinatorWorkerLevels(opts: {
 	levels: SubtaskEntry[][];
+	builderModel: string;
 	artifactsDir: string;
 	signal?: AbortSignal;
 	cwd: string;
 	timeoutMs: number;
 }): Promise<{ workerRuns: Array<{ entry: SubtaskEntry; run: AgentRun }> }> {
-	const { levels, artifactsDir, signal, cwd, timeoutMs } = opts;
+	const { levels, builderModel, artifactsDir, signal, cwd, timeoutMs } = opts;
 	const workerRuns: Array<{ entry: SubtaskEntry; run: AgentRun }> = [];
-	const bModel = castModel("BUILDER");
+	const bModel = builderModel;
 	for (let li = 0; li < levels.length; li++) {
 		const lvl = levels[li]!.map((entry) => ({
 			entry,
@@ -1149,6 +1244,7 @@ async function coordinatorIntegrate(opts: {
 async function coordinatePipeline(opts: {
 	prompt: string;
 	coordinatorModel: string;
+	builderModel: string;
 	subtasksPath: string;
 	artifactsDir: string;
 	signal?: AbortSignal;
@@ -1158,11 +1254,11 @@ async function coordinatePipeline(opts: {
 	sessionId: string;
 	noFixUp?: boolean;
 }): Promise<{ coordinator: AgentRun; workerRuns: Array<{ entry: SubtaskEntry; run: AgentRun }>; manifest?: SubtaskManifest; levels?: SubtaskEntry[][]; error?: string; fixupApplied: boolean; ok: boolean }> {
-	const { prompt, coordinatorModel, subtasksPath, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId, noFixUp } = opts;
+	const { prompt, coordinatorModel, builderModel, subtasksPath, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId, noFixUp } = opts;
 	const { coordinator, manifest, levels, error } = await coordinatorDecompose({ prompt, coordinatorModel, subtasksPath, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId });
 	if (error || !manifest || !levels) return { coordinator, workerRuns: [], error: error ?? "Unknown error", fixupApplied: false, ok: false };
 
-	const { workerRuns } = await coordinatorWorkerLevels({ levels, artifactsDir, signal, cwd, timeoutMs });
+	const { workerRuns } = await coordinatorWorkerLevels({ levels, builderModel, artifactsDir, signal, cwd, timeoutMs });
 	const { coordinator: coordFinal, fixupApplied } = await coordinatorIntegrate({ prompt, coordinatorModel, workerRuns, artifactsDir, signal, cwd, timeoutMs, sessionDir, sessionId, noFixUp });
 	return { coordinator: coordFinal, workerRuns, manifest, levels, fixupApplied, ok: runOk(coordFinal) };
 }
@@ -1428,6 +1524,7 @@ function runChild(opts: {
 		run.status = "working";
 		run.startedAt = started;
 		run.flowMark = run.flow.length;
+		gauntletRunHook?.(run); // register with the live gauntlet dashboard, if one is watching
 
 		// One line of the child's JSON event stream → the relevant AgentRun mutation.
 		const processLine = (line: string) => {
@@ -2266,9 +2363,20 @@ function borderBox(lines: string[], innerW: number): string[] {
 }
 
 // ═══ 7c. Artifact utilities (global for stage functions) ════════════════════
-// Per-run artifacts land under /tmp/fusion-harness-* (the spec'd, inspectable location —
-// note os.tmpdir() on macOS is /var/folders/…, so we pin /tmp explicitly).
-const ARTIFACT_ROOT_G = fs.existsSync("/tmp") ? "/tmp" : os.tmpdir();
+// Per-run artifacts land under <root>/fusion-harness-* (the spec'd, inspectable location).
+// Default root is /tmp (or os.tmpdir() if absent) — but on hosts where /tmp is a small RAM
+// tmpfs (e.g. a 2 GB Orange Pi), a task that writes big files (benchmark scripts, model
+// dumps…) can fill it and ENOSPC the gauntlet's own state.json mid-run. Set
+// FUSION_ARTIFACT_ROOT to a disk-backed path (e.g. /mnt/nas/.fusion-harness) to decouple
+// gauntlet artifacts + sessions from /tmp pressure. Honored by mkArtifacts() & sessionsRootFor().
+const ARTIFACT_ROOT_G = (() => {
+	const env = process.env.FUSION_ARTIFACT_ROOT;
+	if (env && env.trim()) {
+		try { fs.mkdirSync(env, { recursive: true }); return env; }
+		catch (e) { console.error(`[fusion-harness] FUSION_ARTIFACT_ROOT=${env} unusable (${(e as NodeJS.ErrnoException).message}); falling back to /tmp`); }
+	}
+	return fs.existsSync("/tmp") ? "/tmp" : os.tmpdir();
+})();
 const mkArtifacts = async (): Promise<string> => fs.promises.mkdtemp(path.join(ARTIFACT_ROOT_G, "fusion-harness-"));
 // Per-session sink that surfaces gSave write failures to the user via ctx.ui.notify.
 // gSave is module-level (no ctx in scope), so the extension entrypoint wires this on
@@ -4225,43 +4333,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── 8.16 /coordinate <prompt> [--no-fix-up] ──
-	interface SubtaskEntry { id: string; title?: string; prompt?: string; paths?: string[]; dependsOn?: string[]; }
-	interface SubtaskManifest { subtasks?: SubtaskEntry[]; }
-	const validateManifest = (data: any): { ok: true; manifest: SubtaskManifest } | { ok: false; error: string } => {
-		if (!data || typeof data !== "object") return { ok: false, error: "manifest is not a JSON object" };
-		const m = data as SubtaskManifest;
-		if (!Array.isArray(m.subtasks) || m.subtasks.length === 0) return { ok: false, error: "manifest.subtasks must be a non-empty array" };
-		const ids = new Set<string>();
-		for (let i = 0; i < m.subtasks.length; i++) {
-			const s = m.subtasks[i]!;
-			if (!s.id || typeof s.id !== "string") return { ok: false, error: `subtasks[${i}]: missing or invalid 'id'` };
-			if (ids.has(s.id)) return { ok: false, error: `subtasks[${i}]: duplicate id '${s.id}'` };
-			ids.add(s.id);
-			if (!s.prompt || typeof s.prompt !== "string") return { ok: false, error: `subtasks[${i}] (${s.id}): missing 'prompt'` };
-			if (!Array.isArray(s.paths) || s.paths.length === 0) return { ok: false, error: `subtasks[${i}] (${s.id}): 'paths' must be a non-empty array` };
-			if (!Array.isArray(s.dependsOn)) s.dependsOn = [];
-		}
-		return { ok: true, manifest: m };
-	};
-	const topoLevels = (subtasks: SubtaskEntry[]): { levels: SubtaskEntry[][]; error?: string } => {
-		const byId = new Map(subtasks.map((s) => [s.id, s]));
-		const inDeg = new Map<string, number>(), deps = new Map<string, string[]>();
-		for (const s of subtasks) { inDeg.set(s.id, 0); deps.set(s.id, []); }
-		for (const s of subtasks) for (const dep of s.dependsOn ?? []) {
-			if (!byId.has(dep)) return { levels: [], error: `subtask '${s.id}' depends on unknown '${dep}'` };
-			deps.get(dep)!.push(s.id); inDeg.set(s.id, (inDeg.get(s.id) ?? 0) + 1);
-		}
-		const queue: string[] = [];
-		for (const [id, d] of inDeg) if (d === 0) queue.push(id);
-		const levels: SubtaskEntry[][] = []; let visited = 0;
-		while (queue.length) {
-			const batch = [...queue]; queue.length = 0; const level: SubtaskEntry[] = [];
-			for (const id of batch) { level.push(byId.get(id)!); visited++; for (const nx of deps.get(id) ?? []) { const d = (inDeg.get(nx) ?? 1) - 1; inDeg.set(nx, d); if (d === 0) queue.push(nx); } }
-			levels.push(level);
-		}
-		if (visited !== subtasks.length) return { levels: [], error: "circular dependency detected" };
-		return { levels };
-	};
 	pi.registerCommand("coordinate", {
 		description: "Orchestrate subtasks: COORDINATOR decomposes, workers execute in dependency order, COORDINATOR integrates — /coordinate <prompt> [--no-fix-up]",
 		handler: async (raw, ctx) => {
@@ -4572,6 +4643,7 @@ export default function (pi: ExtensionAPI) {
 		tokensIn?: number;
 		tokensOut?: number;
 		costUsd?: number;
+		reasoningSnippet?: string; // last thinking block from the stage's agent(s) — backward-compatible
 	}
 	interface CampaignState {
 		prompt: string;
@@ -4631,6 +4703,214 @@ export default function (pi: ExtensionAPI) {
 	const accumulateCost = (stages: StageState[]): number =>
 		stages.reduce((s, st) => s + (st.costUsd ?? 0), 0);
 
+	/** Glyph for a stage status — shared by the dashboard widget and the SVG generator. */
+	const stageGlyph = (status: StageState["status"]): string =>
+		status === "done" ? "✓" : status === "failed" ? "✗" : status === "skipped" ? "⊘" : status === "working" ? "◐" : "○";
+
+	/** Theme color name for a stage status. */
+	const stageColorName = (status: StageState["status"]): string =>
+		status === "done" ? "success" : status === "failed" ? "error" : status === "working" ? "warning" : "dim";
+
+	/** Wall-clock seconds a stage occupied, parsed from its ISO timestamps. */
+	const stageElapsedSecs = (s: StageState): number | undefined => {
+		if (!s.startedAt) return undefined;
+		const end = s.endedAt ? Date.parse(s.endedAt) : Date.now();
+		const ms = end - Date.parse(s.startedAt);
+		return Number.isFinite(ms) && ms >= 0 ? ms / 1000 : undefined;
+	};
+
+	/** Read the subtask checklist from `<dir>/subtasks.json`, pairing each entry with worker-done state. */
+	const readSubtaskChecklist = (dir: string): Array<{ id: string; title: string; done: boolean }> => {
+		try {
+			const raw = fs.readFileSync(path.join(dir, "subtasks.json"), "utf-8");
+			const v = validateManifest(JSON.parse(raw));
+			if (!v.ok) return [];
+			return v.manifest.subtasks!.map((s) => {
+				let done = false;
+				try { done = fs.existsSync(path.join(dir, `worker-${s.id}.md`)); } catch {}
+				return { id: s.id, title: s.title ?? s.id, done };
+			});
+		} catch {
+			return [];
+		}
+	};
+
+	/** Find the run currently producing reasoning + its latest thinking text (live proof of life). */
+	const pickReasoning = (runs: AgentRun[]): { role: Role; model: string; text: string } | undefined => {
+		for (let i = runs.length - 1; i >= 0; i--) {
+			const r = runs[i];
+			if (!r) continue;
+			if (r.streamThinking && r.streamThinking.trim()) return { role: r.role, model: r.model, text: r.streamThinking };
+			for (let j = r.flow.length - 1; j >= 0; j--) {
+				const item = r.flow[j];
+				if (item && item.type === "thinking" && item.text.trim()) return { role: r.role, model: r.model, text: item.text };
+			}
+		}
+		return undefined;
+	};
+
+	/** Format a per-stage cost, or `—` when the stage had no billable usage. */
+	const stageCostLabel = (s: StageState): string => (s.costUsd && s.costUsd > 0 ? `$${s.costUsd.toFixed(4)}` : "—");
+
+	/**
+	 * Tiered gauntlet dashboard — pure renderer returning styled lines for a given width.
+	 * Reads only from `state` + `activeRuns` + the filesystem (idempotent; never mutates).
+	 */
+	function renderGauntletLines(theme: any, width: number, state: CampaignState, activeRuns: AgentRun[], dir: string, startedAt: number): string[] {
+		const lines: string[] = [];
+		const elapsed = fmtSecs(Date.now() - startedAt);
+		const totalCost = accumulateCost(state.stages);
+		const N = state.stages.length;
+		const headerCore = theme.fg("customMessageLabel", theme.bold(`GAUNTLET · ${N}-stage campaign`)) + theme.fg("dim", ` · ${elapsed} · ~$${totalCost.toFixed(4)}`);
+		const checklist = readSubtaskChecklist(dir);
+		const working = state.stages.find((s) => s.status === "working");
+
+		// ── Narrow tier (<60 cols): single header line + glyph-only progress line ──
+		if (width < 60) {
+			lines.push(theme.fg("customMessageLabel", theme.bold(`GAUNTLET · ${N}-stage`)) + theme.fg("dim", ` · ${elapsed} · ~$${totalCost.toFixed(4)}`));
+			lines.push(theme.fg("muted", state.stages.map((s) => theme.fg(stageColorName(s.status), stageGlyph(s.status))).join("")));
+			return lines;
+		}
+
+		lines.push(headerCore);
+
+		const full = width >= MIN_TWO_COL_WIDTH;
+		for (let i = 0; i < N; i++) {
+			const s = state.stages[i]!;
+			const glyph = stageGlyph(s.status);
+			const color = stageColorName(s.status);
+			const secs = stageElapsedSecs(s);
+			const name = (s === working) ? theme.fg(color, theme.bold(s.name)) : theme.fg(color, s.name);
+			let row: string;
+			if (full) {
+				const bits = [theme.fg(color, `${glyph} ${i + 1}.`), name];
+				if (secs !== undefined) bits.push(theme.fg("dim", `${secs.toFixed(1)}s`));
+				bits.push(theme.fg("dim", stageCostLabel(s)));
+				row = bits.join(theme.fg("dim", " · "));
+			} else {
+				const bits = [theme.fg(color, glyph), name];
+				if (secs !== undefined) bits.push(theme.fg("dim", `${secs.toFixed(1)}s`));
+				row = bits.join(theme.fg("dim", " · "));
+			}
+			lines.push(row);
+
+			// Reasoning snippet only on the active (working) stage, and only at full width.
+			if (full && s === working) {
+				const reason = pickReasoning(activeRuns);
+				if (reason) {
+					const prefix = theme.fg(ROLE_COLOR[reason.role], `${ROLE_GLYPH[reason.role]} ${reason.role}`) + theme.fg("dim", ` · ${shortModel(reason.model)} — `);
+					lines.push(theme.fg("muted", `    ${prefix}${snippetTail(reason.text)}`));
+				} else {
+					lines.push(theme.fg("dim", `    ${stageGlyph("working")} thinking…`));
+				}
+			}
+		}
+
+		// Subtask checklist (appears once DECOMPOSE has written subtasks.json).
+		if (checklist.length > 0) {
+			lines.push("");
+			lines.push(theme.fg("dim", "subtasks:"));
+			for (const c of checklist) {
+				lines.push(`  ${c.done ? theme.fg("success", "✓") : theme.fg("dim", "○")} ${c.title}`);
+			}
+		}
+		return lines;
+	}
+
+	/** Install the live dashboard widget + refresh ticker; returns a cleanup fn. */
+	const setupGauntletDashboard = (ctx: any, state: CampaignState, activeRuns: AgentRun[], dir: string, startedAt: number): (() => void) => {
+		const render = () => {
+			try {
+				ctx.ui.setWidget(
+					CUSTOM_TYPE,
+					(_tui: any, theme: any) => {
+						const c = new Container();
+						c.addChild(new GauntletDashboard((w) => renderGauntletLines(theme, w, state, activeRuns, dir, startedAt)));
+						return c;
+					},
+					{ placement: "aboveEditor" },
+				);
+			} catch { /* widget is best-effort; no-op outside the TUI */ }
+		};
+		render();
+		const ticker = setInterval(render, WIDGET_TICK_MS);
+		return () => { clearInterval(ticker); try { ctx.ui.setWidget(CUSTOM_TYPE, undefined); } catch {} };
+	};
+
+	/** XML-escape text for SVG. */
+	const svgEscape = (s: string): string =>
+		(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+	/** SVG color per stage status, matching the hand-authored images/ palette. */
+	const stageSvgColor = (status: StageState["status"]): string =>
+		status === "done" ? "#3fb950" : status === "failed" ? "#f85149" : status === "working" ? "#d29922" : "#8b949e";
+
+	/** Verdict label per stage status for the SVG. */
+	const stageVerdict = (status: StageState["status"]): string =>
+		status === "done" ? "PASS" : status === "failed" ? "FAIL" : status === "skipped" ? "SKIPPED" : status === "working" ? "HALTED" : "NOT RUN";
+
+	/**
+	 * Build a self-contained campaign SVG from `state` and write it to `<dir>/campaign.svg`.
+	 * Pure apart from the single file write; tolerates missing cost/timing with a `—` fallback.
+	 * Returns the absolute path written.
+	 */
+	function generateGauntletSvg(state: CampaignState, dir: string, startedAt: number, prompt: string): string {
+		const stages = state.stages;
+		const totalElapsed = fmtSecs(Date.now() - startedAt);
+		const totalCost = accumulateCost(stages);
+		const checklist = readSubtaskChecklist(dir);
+		const promptLine = (prompt ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+		const padX = 28;
+		const rowH = 30;
+		const titleY = 46;
+		const subY = 72;
+		const stageTop = 98;
+		const stageBlockH = Math.max(rowH * stages.length + 8, 60);
+		const subTop = stageTop + stageBlockH + 24;
+		const subBlockH = checklist.length > 0 ? Math.max(checklist.length * 22 + 30, 50) : 0;
+		const height = (checklist.length > 0 ? subTop + subBlockH : stageTop + stageBlockH) + 34;
+		const W = 760;
+		const innerW = W - padX * 2;
+		const out: string[] = [];
+		out.push(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${height}" width="${W}" height="${height}" role="img" aria-label="Gauntlet campaign summary — ${svgEscape(stages.map((s) => s.name + ": " + stageVerdict(s.status)).join(", "))}" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">`);
+		out.push(`<rect x="0" y="0" width="${W}" height="${height}" rx="14" fill="#0d1117"/>`);
+		out.push(`<rect x="0.75" y="0.75" width="${W - 1.5}" height="${height - 1.5}" rx="13.5" fill="none" stroke="#30363d" stroke-width="1.5"/>`);
+		out.push(`<text x="${W / 2}" y="${titleY}" text-anchor="middle" fill="#e6edf3" font-size="20" font-weight="700" letter-spacing="2">GAUNTLET CAMPAIGN</text>`);
+		out.push(`<text x="${W / 2}" y="${subY}" text-anchor="middle" fill="#8b949e" font-size="12">${svgEscape(promptLine || "(no prompt)")} · ${totalElapsed} · ~$${totalCost.toFixed(4)}</text>`);
+		let y = stageTop;
+		for (let i = 0; i < stages.length; i++) {
+			const s = stages[i]!;
+			const color = stageSvgColor(s.status);
+			const secs = stageElapsedSecs(s);
+			out.push(`<rect x="${padX}" y="${y}" width="${innerW}" height="${rowH - 6}" rx="7" fill="#161b22" stroke="${color}" stroke-width="1.25"/>`);
+			out.push(`<text x="${padX + 14}" y="${y + 19}" fill="${color}" font-size="15" font-weight="700">${stageGlyph(s.status)}</text>`);
+			out.push(`<text x="${padX + 40}" y="${y + 19}" fill="#e6edf3" font-size="14" font-weight="600">${svgEscape(`${i + 1}. ${s.name}`)}</text>`);
+			const right: string[] = [];
+			right.push(stageVerdict(s.status));
+			if (secs !== undefined) right.push(`${secs.toFixed(1)}s`);
+			right.push(stageCostLabel(s));
+			const rightLabel = right.join(" · ");
+			const approxW = rightLabel.length * 7.2;
+			out.push(`<text x="${padX + innerW - 12 - approxW}" y="${y + 19}" text-anchor="start" fill="${color}" font-size="12">${svgEscape(rightLabel)}</text>`);
+			y += rowH;
+		}
+		if (checklist.length > 0) {
+			out.push(`<text x="${padX}" y="${subTop - 6}" fill="#8b949e" font-size="12" font-weight="600">SUBTASKS</text>`);
+			let sy = subTop + 14;
+			for (const c of checklist) {
+				const cc = c.done ? "#3fb950" : "#8b949e";
+				out.push(`<text x="${padX + 8}" y="${sy}" fill="${cc}" font-size="13">${c.done ? "✓" : "○"} ${svgEscape(c.title)}</text>`);
+			sy += 22;
+			}
+		}
+		out.push(`<text x="${W / 2}" y="${height - 12}" text-anchor="middle" fill="#484f58" font-size="10">fusion-harness · gauntlet campaign</text>`);
+		out.push(`</svg>`);
+		const svg = out.join("\n");
+		const svgPath = path.join(dir, "campaign.svg");
+		try { fs.writeFileSync(svgPath, svg); } catch {}
+		return svgPath;
+	}
+
 	/**
 	 * Gauntlet stage runner — executes one stage and updates campaign state.
 	 * Returns true if the campaign should continue, false to halt.
@@ -4642,11 +4922,13 @@ export default function (pi: ExtensionAPI) {
 		prompt: string,
 		ctx: any,
 		stopper: { signal: AbortSignal; stopped: () => boolean; release: () => void },
-		campaignStartedAt: number,
+		_campaignStartedAt: number,
+		activeRuns: AgentRun[],
 	): Promise<boolean> {
 		if (stopper.stopped()) return false;
 		const stage = state.stages[stageIdx]!;
 		stage.status = "working";
+		activeRuns.length = 0; // reset the live-dashboard run registry for this stage
 		stage.startedAt = new Date().toISOString();
 		await saveCampaignState(dir, state);
 		ctx.ui.setStatus(CUSTOM_TYPE, `gauntlet: stage ${stageIdx + 1}/${state.stages.length} — ${stage.name}…`);
@@ -4807,6 +5089,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					const { workerRuns } = await coordinatorWorkerLevels({
 						levels,
+						builderModel: castModel("BUILDER"),
 						artifactsDir: dir,
 						signal: stopper.signal,
 						cwd: ctx.cwd,
@@ -4922,54 +5205,12 @@ export default function (pi: ExtensionAPI) {
 		stage.endedAt = new Date().toISOString();
 		stage.prompt = prompt;
 		stage.castSnapshot = { ...cast };
+		// Capture the stage's final reasoning snapshot from whatever agent(s) ran — for BUILD,
+		// which fans out to many workers, `activeRuns` holds them all so the most recent
+		// thinking across any worker wins. Persisted for the SVG summary + resume continuity.
+		const finalReasoning = latestThinking(activeRuns);
+		if (finalReasoning) stage.reasoningSnippet = snippetTail(finalReasoning);
 		await saveCampaignState(dir, state);
-
-		// Goal: tiered board — full width if ≥100 cols, single line otherwise
-		try {
-			ctx.ui.setWidget(
-				CUSTOM_TYPE,
-				(_tui: any, theme: any) => {
-					const c = new Container();
-					const elapsed = fmtSecs(Date.now() - campaignStartedAt);
-					const totalCost = accumulateCost(state.stages);
-					c.addChild(
-						new Text(
-							theme.fg("customMessageLabel", theme.bold(`GAUNTLET · ${state.stages.length}-stage campaign`)) +
-								theme.fg("dim", ` · ${elapsed} · ~$${totalCost.toFixed(4)}`),
-							1,
-							0,
-						),
-					);
-					const stageLine = state.stages
-						.map((s, i) => {
-							const glyph = s.status === "done" ? "✓" : s.status === "failed" ? "✗" : s.status === "skipped" ? "⊘" : s.status === "working" ? "◐" : "○";
-							const color = s.status === "done" ? "success" : s.status === "failed" ? "error" : s.status === "working" ? "warning" : "dim";
-							return theme.fg(color, `${glyph} ${i + 1}. ${s.name}`);
-						})
-						.join(" · ");
-					c.addChild(new Text(theme.fg("muted", stageLine), 1, 0));
-					// Subtask checklist (after DECOMPOSE)
-					const subtasksPath = path.join(dir, "subtasks.json");
-					try {
-						const subtasksRaw = fs.readFileSync(subtasksPath, "utf-8");
-						const subParsed = JSON.parse(subtasksRaw);
-						const subV = validateManifest(subParsed);
-						if (subV.ok) {
-							for (const s of subV.manifest.subtasks!) {
-								const workerFile = path.join(dir, `worker-${s.id}.md`);
-								let exists = false;
-								try {
-									exists = fs.existsSync(workerFile);
-								} catch {}
-								c.addChild(new Text(`  ${exists ? "✓" : "○"} ${s.title ?? s.id}`, 1, 0));
-							}
-						}
-					} catch {}
-					return c;
-				},
-				{ placement: "aboveEditor" },
-			);
-		} catch {}
 
 		return stage.status === "done" || stage.status === "skipped";
 	}
@@ -5141,16 +5382,23 @@ export default function (pi: ExtensionAPI) {
 
 			const campaignStartedAt = Date.now();
 			const stopper = startStoppable(ctx, "chain");
+			const activeRuns: AgentRun[] = [];
+			gauntletRunHook = (r) => { activeRuns.push(r); };
+			const stopDashboard = setupGauntletDashboard(ctx, campaignState, activeRuns, realDir, campaignStartedAt);
 
+			let campaignSvgPath: string | undefined;
 			try {
 				for (let i = 0; i < campaignState.stages.length; i++) {
 					if (stopper.stopped()) break;
-					const cont = await runGauntletStage(i, campaignState, realDir, prompt, ctx, stopper, campaignStartedAt);
+					const cont = await runGauntletStage(i, campaignState, realDir, prompt, ctx, stopper, campaignStartedAt, activeRuns);
 					if (!cont) break;
 				}
 
 				const completed = campaignState.stages.filter((s) => s.status === "done" || s.status === "skipped").length;
-				if (completed === campaignState.stages.length) {
+				const allDone = completed === campaignState.stages.length;
+				campaignSvgPath = generateGauntletSvg(campaignState, realDir, campaignStartedAt, prompt);
+				const svgLine = campaignSvgPath ? `Campaign SVG: ${campaignSvgPath}` : "";
+				if (allDone) {
 					panel(
 						{
 							kind: "verdict",
@@ -5165,7 +5413,8 @@ export default function (pi: ExtensionAPI) {
 							``,
 							`Stages: ${stageNames.join(" → ")}`,
 							`Artifacts: ${realDir}`,
-						].join("\n"),
+							svgLine,
+						].filter(Boolean).join("\n"),
 					);
 				} else {
 					const failed = campaignState.stages.filter((s) => s.status === "failed").map((s) => s.name);
@@ -5184,14 +5433,14 @@ export default function (pi: ExtensionAPI) {
 							`**Completed:** ${completed}/${campaignState.stages.length} stages`,
 							failed.length ? `**Failed:** ${failed.join(", ")}` : `**Stopped:** escape`,
 							`Artifacts: ${realDir}`,
-						].join("\n"),
+							svgLine,
+						].filter(Boolean).join("\n"),
 					);
 				}
 			} finally {
 				stopper.release();
-				try {
-					ctx.ui.setWidget(CUSTOM_TYPE, undefined);
-				} catch {}
+				gauntletRunHook = undefined;
+				stopDashboard();
 				ctx.ui.setStatus(CUSTOM_TYPE, undefined);
 			}
 		},
@@ -5263,27 +5512,31 @@ export default function (pi: ExtensionAPI) {
 				panel({ kind: "banner", command: "gauntlet", ok: true, prompt, roles: [{ role: "ARCHITECT", model: architectModel() }, { role: "BUILDER", model: builderModel() }], artifactsDir: targetDir }, "resuming…");
 
 				const stopper = startStoppable(ctx, "gauntlet");
+				const activeRuns: AgentRun[] = [];
+				gauntletRunHook = (r) => { activeRuns.push(r); };
+				const stopDashboard = setupGauntletDashboard(ctx, state, activeRuns, targetDir, campaignStartedAt);
 				try {
 					for (let i = startIdx; i < state.stages.length; i++) {
 						if (stopper.stopped()) break;
 						if (state.stages[i]!.status === "done") continue;
-						const cont = await runGauntletStage(i, state, targetDir, prompt, ctx, stopper, campaignStartedAt);
+						const cont = await runGauntletStage(i, state, targetDir, prompt, ctx, stopper, campaignStartedAt, activeRuns);
 						if (!cont) break;
 					}
 				} finally {
 					stopper.release();
+					gauntletRunHook = undefined;
 					ctx.ui.setStatus(CUSTOM_TYPE, undefined);
-					try {
-						ctx.ui.setWidget(CUSTOM_TYPE, undefined);
-					} catch {}
+					stopDashboard();
 				}
 
 				const completed = state.stages.filter((s) => s.status === "done" || s.status === "skipped").length;
+				const svgPath = generateGauntletSvg(state, targetDir, campaignStartedAt, prompt);
+				const svgLine = svgPath ? `\nCampaign SVG: ${svgPath}` : "";
 				if (completed === state.stages.length) {
-					panel({ kind: "verdict", command: "gauntlet", ok: true, artifactsDir: targetDir, totalMs: Date.now() - campaignStartedAt, totalCostUsd: accumulateCost(state.stages) }, `## Campaign Complete\n\nAll ${state.stages.length} stages completed successfully.\n\nArtifacts: ${targetDir}`);
+					panel({ kind: "verdict", command: "gauntlet", ok: true, artifactsDir: targetDir, totalMs: Date.now() - campaignStartedAt, totalCostUsd: accumulateCost(state.stages) }, `## Campaign Complete\n\nAll ${state.stages.length} stages completed successfully.\n\nArtifacts: ${targetDir}${svgLine}`);
 				} else {
 					const failed = state.stages.filter((s) => s.status === "failed").map((s) => s.name);
-					panel({ kind: "error", command: "gauntlet", ok: false, artifactsDir: targetDir, totalMs: Date.now() - campaignStartedAt, totalCostUsd: accumulateCost(state.stages) }, `## Campaign Halted\n\n**Completed:** ${completed}/${state.stages.length} stages\n${failed.length ? `**Failed:** ${failed.join(", ")}` : "**Stopped:** escape pressed"}\n\nArtifacts: ${targetDir}`);
+					panel({ kind: "error", command: "gauntlet", ok: false, artifactsDir: targetDir, totalMs: Date.now() - campaignStartedAt, totalCostUsd: accumulateCost(state.stages) }, `## Campaign Halted\n\n**Completed:** ${completed}/${state.stages.length} stages\n${failed.length ? `**Failed:** ${failed.join(", ")}` : "**Stopped:** escape pressed"}\n\nArtifacts: ${targetDir}${svgLine}`);
 				}
 				return;
 			}
@@ -5338,15 +5591,20 @@ export default function (pi: ExtensionAPI) {
 
 			const campaignStartedAt = Date.now();
 			const stopper = startStoppable(ctx, "gauntlet");
+			const activeRuns: AgentRun[] = [];
+			gauntletRunHook = (r) => { activeRuns.push(r); };
+			const stopDashboard = setupGauntletDashboard(ctx, campaignState, activeRuns, realDir, campaignStartedAt);
 
 			try {
 				for (let i = 0; i < campaignState.stages.length; i++) {
 					if (stopper.stopped()) break;
-					const cont = await runGauntletStage(i, campaignState, realDir, prompt, ctx, stopper, campaignStartedAt);
+					const cont = await runGauntletStage(i, campaignState, realDir, prompt, ctx, stopper, campaignStartedAt, activeRuns);
 					if (!cont) break;
 				}
 
 				const completed = campaignState.stages.filter((s) => s.status === "done" || s.status === "skipped").length;
+				const svgPath = generateGauntletSvg(campaignState, realDir, campaignStartedAt, prompt);
+				const svgLine = svgPath ? `\n**Campaign SVG:** ${svgPath}\n` : "";
 				if (completed === campaignState.stages.length) {
 					panel(
 						{
@@ -5363,7 +5621,7 @@ export default function (pi: ExtensionAPI) {
 							`All ${campaignState.stages.length} stages completed.`,
 							``,
 							`**Artifacts:** ${realDir}`,
-							``,
+							svgLine,
 							...campaignState.stages.map((s, i) => {
 								const artList = Object.entries(s.artifacts).map(([k, v]) => `  • ${k}: ${v}`).join("\n");
 								return `### ${i + 1}. ${s.name} — ${s.status}${artList ? `\n${artList}` : ""}`;
@@ -5388,16 +5646,15 @@ export default function (pi: ExtensionAPI) {
 							failed.length ? `**Failed:** ${failed.join(", ")}` : `**Stopped:** escape pressed`,
 							``,
 							`**Artifacts:** ${realDir}`,
-							``,
+							svgLine,
 							`To resume: \`/gauntlet --resume\``,
-						].join("\n"),
+						].filter((l) => l != null && l !== "").join("\n"),
 					);
 				}
 			} finally {
 				stopper.release();
-				try {
-					ctx.ui.setWidget(CUSTOM_TYPE, undefined);
-				} catch {}
+				gauntletRunHook = undefined;
+				stopDashboard();
 				ctx.ui.setStatus(CUSTOM_TYPE, undefined);
 			}
 		},
