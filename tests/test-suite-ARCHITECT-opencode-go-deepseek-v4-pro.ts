@@ -26,7 +26,7 @@ const HANDOFF_MAX = 60_000;
 // ── Role type (must include all new roles from PR B) ──────────────────────────
 type Role = "ARCHITECT" | "BUILDER" | "FUSION" | "VALIDATOR"
   | "DEBATER_A" | "DEBATER_B" | "JUDGE"
-  | "COORDINATOR" | "PANEL" | "CHAIRMAN"
+  | "COORDINATOR" | "PANEL" | "PANEL_2" | "CHAIRMAN"
   | "ATTACKER";
 type Side = "architect" | "builder";
 type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -39,12 +39,12 @@ type Cast = Partial<Record<Role, CastMember>>;
 const ROLE_COLOR: Record<Role, string> = {
   ARCHITECT: "accent", BUILDER: "warning", FUSION: "success", VALIDATOR: "mdLink",
   DEBATER_A: "accent", DEBATER_B: "warning", JUDGE: "success",
-  COORDINATOR: "accent", PANEL: "mdLink", CHAIRMAN: "success", ATTACKER: "warning",
+  COORDINATOR: "accent", PANEL: "mdLink", PANEL_2: "mdLink", CHAIRMAN: "success", ATTACKER: "warning",
 };
 const ROLE_GLYPH: Record<Role, string> = {
   ARCHITECT: "◆", BUILDER: "▲", FUSION: "⧉", VALIDATOR: "✓",
   DEBATER_A: "◇", DEBATER_B: "△", JUDGE: "⚖",
-  COORDINATOR: "⬡", PANEL: "◈", CHAIRMAN: "◆", ATTACKER: "✖",
+  COORDINATOR: "⬡", PANEL: "◈", PANEL_2: "☷", CHAIRMAN: "◆", ATTACKER: "✖",
 };
 
 // ── Cast system constants ─────────────────────────────────────────────────────
@@ -52,12 +52,13 @@ const CAST_FILE = ".fusion-harness.json";
 const KNOWN_ROLES: Role[] = [
   "ARCHITECT", "BUILDER", "FUSION", "VALIDATOR",
   "DEBATER_A", "DEBATER_B", "JUDGE",
-  "COORDINATOR", "PANEL", "CHAIRMAN", "ATTACKER",
+  "COORDINATOR", "PANEL", "PANEL_2", "CHAIRMAN", "ATTACKER",
 ];
+const MULTI_PICK_ROLES: Role[] = ["PANEL", "PANEL_2"];
 const ROLE_SIDE: Record<Role, Side> = {
   ARCHITECT: "architect", BUILDER: "builder", FUSION: "architect", VALIDATOR: "architect",
   DEBATER_A: "architect", DEBATER_B: "builder", JUDGE: "architect",
-  COORDINATOR: "architect", PANEL: "builder", CHAIRMAN: "architect", ATTACKER: "architect",
+  COORDINATOR: "architect", PANEL: "builder", PANEL_2: "architect", CHAIRMAN: "architect", ATTACKER: "architect",
 };
 const SIDE_PRIMARY: Record<Side, Role> = { architect: "ARCHITECT", builder: "BUILDER" };
 
@@ -274,25 +275,25 @@ function section(name: string) {
 // ═══════════════════════════════════════════════════════════════════════════════
 section("1. TYPE & CONSTANT INTEGRITY");
 
-test("Role type includes all 11 roles (4 original + 7 new)", () => {
+test("Role type includes all 12 roles (4 original + 8 new)", () => {
   const expected: Role[] = [
     "ARCHITECT", "BUILDER", "FUSION", "VALIDATOR",
     "DEBATER_A", "DEBATER_B", "JUDGE",
-    "COORDINATOR", "PANEL", "CHAIRMAN", "ATTACKER",
+    "COORDINATOR", "PANEL", "PANEL_2", "CHAIRMAN", "ATTACKER",
   ];
-  assert.strictEqual(KNOWN_ROLES.length, 11);
+  assert.strictEqual(KNOWN_ROLES.length, 12);
   for (const r of expected) {
     assert.ok(KNOWN_ROLES.includes(r), `Missing role: ${r}`);
   }
 });
 
-test("ROLE_COLOR has entries for all 11 roles", () => {
+test("ROLE_COLOR has entries for all 12 roles", () => {
   for (const r of KNOWN_ROLES) {
     assert.ok(ROLE_COLOR[r] !== undefined, `ROLE_COLOR missing for ${r}`);
   }
 });
 
-test("ROLE_GLYPH has entries for all 11 roles", () => {
+test("ROLE_GLYPH has entries for all 12 roles", () => {
   for (const r of KNOWN_ROLES) {
     assert.ok(ROLE_GLYPH[r] !== undefined, `ROLE_GLYPH missing for ${r}`);
   }
@@ -881,6 +882,86 @@ test("PANEL multi-model parsing (comma-separated)", () => {
   assert.strictEqual(models[2], "anthropic/claude-fable-5");
 });
 
+test("PANEL_2 expandCastModels CSV-splits like PANEL", () => {
+  const expandCastModels = (role: Role | string, raw: string): string[] => {
+    const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+    if (MULTI_PICK_ROLES.includes(role as Role)) return parts;
+    return parts.length ? [raw.trim()] : [];
+  };
+  assert.deepStrictEqual(
+    expandCastModels("PANEL_2", "prov/a, prov/b,prov/c"),
+    ["prov/a", "prov/b", "prov/c"],
+  );
+});
+
+type PanelSourceRole = "PANEL" | "PANEL_2";
+type PanelistEntry = { model: string; role: PanelSourceRole };
+const expandCastModelsLocal = (role: Role | string, raw: string): string[] => {
+  const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  if (MULTI_PICK_ROLES.includes(role as Role)) return parts;
+  return parts.length ? [raw.trim()] : [];
+};
+const collectPanelModels = (
+  cast: Cast,
+  castModelFn: (role: Role) => string,
+): PanelistEntry[] => {
+  const panelRaw = cast["PANEL"]?.model ?? castModelFn("ARCHITECT");
+  const panel2Raw = cast["PANEL_2"]?.model ?? "";
+  const fromPanel = expandCastModelsLocal("PANEL", panelRaw);
+  const fromPanel2 = expandCastModelsLocal("PANEL_2", panel2Raw);
+  const seen = new Set<string>();
+  const out: PanelistEntry[] = [];
+  for (const model of fromPanel) {
+    if (seen.has(model)) continue;
+    seen.add(model);
+    out.push({ model, role: "PANEL" });
+  }
+  for (const model of fromPanel2) {
+    if (seen.has(model)) continue;
+    seen.add(model);
+    out.push({ model, role: "PANEL_2" });
+  }
+  return out;
+};
+
+test("collectPanelModels merges PANEL then PANEL_2 with dedupe", () => {
+  const cast: Cast = {
+    PANEL: { model: "a/x,b/y" },
+    PANEL_2: { model: "b/y,c/z" },
+  };
+  assert.deepStrictEqual(collectPanelModels(cast, (r) => castModel(cast, r)), [
+    { model: "a/x", role: "PANEL" },
+    { model: "b/y", role: "PANEL" },
+    { model: "c/z", role: "PANEL_2" },
+  ]);
+});
+
+test("collectPanelModels empty PANEL_2 keeps PANEL-only list", () => {
+  const cast: Cast = { PANEL: { model: "a/x,b/y" } };
+  const out = collectPanelModels(cast, (r) => castModel(cast, r));
+  assert.deepStrictEqual(out, [
+    { model: "a/x", role: "PANEL" },
+    { model: "b/y", role: "PANEL" },
+  ]);
+});
+
+test("collectPanelModels empty PANEL+PANEL_2 falls back to ARCHITECT only on PANEL path", () => {
+  const cast: Cast = { ARCHITECT: { model: "prov/arch" } };
+  let panel2Asked = false;
+  const out = collectPanelModels(cast, (role) => {
+    if (role === "PANEL_2") panel2Asked = true;
+    return castModel(cast, role);
+  });
+  assert.strictEqual(panel2Asked, false);
+  assert.deepStrictEqual(out, [{ model: "prov/arch", role: "PANEL" }]);
+  assert.ok(out.length < 2); // caller refuses spawn
+});
+
+test("COMMAND_CAST.council includes PANEL_2", () => {
+  const council: Role[] = ["PANEL", "PANEL_2", "CHAIRMAN"];
+  assert.deepStrictEqual(council, ["PANEL", "PANEL_2", "CHAIRMAN"]);
+});
+
 test("PANEL requires minimum 2 panelists", () => {
   const single = "zai/glm-5.2".split(",").map(s => s.trim()).filter(Boolean);
   assert.strictEqual(single.length, 1);
@@ -931,12 +1012,13 @@ test("parallel agents use FULL_TOOLS", () => {
   assert.ok(FULL_TOOLS.includes("write"));
 });
 
-test("cast sheet multiPick includes PANEL only", () => {
-  const multiPickRoles: Role[] = ["PANEL"];
-  assert.ok(multiPickRoles.includes("PANEL"));
+test("cast sheet multiPick includes PANEL and PANEL_2", () => {
+  assert.deepStrictEqual(MULTI_PICK_ROLES, ["PANEL", "PANEL_2"]);
+  assert.ok(MULTI_PICK_ROLES.includes("PANEL"));
+  assert.ok(MULTI_PICK_ROLES.includes("PANEL_2"));
   // Non-multi-pick roles should NOT be in this list
-  assert.ok(!multiPickRoles.includes("ARCHITECT"));
-  assert.ok(!multiPickRoles.includes("JUDGE"));
+  assert.ok(!MULTI_PICK_ROLES.includes("ARCHITECT"));
+  assert.ok(!MULTI_PICK_ROLES.includes("JUDGE"));
 });
 
 test("letterOf mapping for council anonymization", () => {

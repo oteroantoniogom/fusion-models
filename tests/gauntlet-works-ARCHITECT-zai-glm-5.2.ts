@@ -378,11 +378,11 @@ test("L3 · GAUNTLET_STAGE_NAMES (from source) maps every stage to its board gly
 	});
 });
 
-test("L3 · COMMAND_CAST[\"gauntlet\"] (from source) has all six roles", () => {
+test("L3 · COMMAND_CAST[\"gauntlet\"] (from source) has all seven roles including PANEL_2", () => {
 	const m = SRC.match(/gauntlet:\s*\[([^\]]+)\]/);
 	assert.ok(m, "gauntlet cast not found in COMMAND_CAST");
 	const roles = m[1]!.split(",").map((s) => s.trim().replace(/["'`]/g, ""));
-	assert.deepStrictEqual(roles, ["PANEL", "CHAIRMAN", "VALIDATOR", "COORDINATOR", "BUILDER", "ATTACKER"]);
+	assert.deepStrictEqual(roles, ["PANEL", "PANEL_2", "CHAIRMAN", "VALIDATOR", "COORDINATOR", "BUILDER", "ATTACKER"]);
 });
 
 test("L3 · STAGE_PREREQS (from source) matches the documented handoff contract", () => {

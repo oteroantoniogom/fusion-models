@@ -119,12 +119,12 @@ const KNOWN_ROLES: readonly string[] = [
 	"ARCHITECT", "BUILDER", "FUSION", "VALIDATOR",
 	"DEBATER_A", "DEBATER_B", "JUDGE",
 	"COORDINATOR",
-	"PANEL", "CHAIRMAN",
+	"PANEL", "PANEL_2", "CHAIRMAN",
 	"ATTACKER",
 ];
 
 /** Roles whose cast.model is a comma-separated multi-pick list (e.g. PANEL). */
-const MULTI_PICK_ROLES: readonly Role[] = ["PANEL"];
+const MULTI_PICK_ROLES: readonly Role[] = ["PANEL", "PANEL_2"];
 
 /** Expand a cast model string into one or more provider/id entries. */
 const expandCastModels = (role: Role | string, raw: string): string[] => {
@@ -132,6 +132,38 @@ const expandCastModels = (role: Role | string, raw: string): string[] => {
 	if (MULTI_PICK_ROLES.includes(role as Role)) return parts;
 	return parts.length ? [raw.trim()] : [];
 };
+
+/** Cast source role for a council panelist (PANEL vs PANEL_2). */
+type PanelSourceRole = "PANEL" | "PANEL_2";
+/** One panelist in the combined council pool, tagged with its cast source. */
+type PanelistEntry = { model: string; role: PanelSourceRole };
+
+/**
+ * Build the deduped PANEL ∪ PANEL_2 panelist pool for /council and gauntlet council deliberate.
+ * PANEL falls back to ARCHITECT when unset; PANEL_2 empty contributes zero (never castModel(PANEL_2)).
+ */
+function collectPanelModels(
+	cast: Cast,
+	castModel: (role: Role) => string,
+): PanelistEntry[] {
+	const panelRaw = cast["PANEL"]?.model ?? castModel("ARCHITECT");
+	const panel2Raw = cast["PANEL_2"]?.model ?? "";
+	const fromPanel = expandCastModels("PANEL", panelRaw);
+	const fromPanel2 = expandCastModels("PANEL_2", panel2Raw);
+	const seen = new Set<string>();
+	const out: PanelistEntry[] = [];
+	for (const model of fromPanel) {
+		if (seen.has(model)) continue;
+		seen.add(model);
+		out.push({ model, role: "PANEL" });
+	}
+	for (const model of fromPanel2) {
+		if (seen.has(model)) continue;
+		seen.add(model);
+		out.push({ model, role: "PANEL_2" });
+	}
+	return out;
+}
 
 /** Which side a role belongs to — every role inherits its side's default model. */
 const ROLE_SIDE: Record<string, Side> = {
@@ -144,6 +176,7 @@ const ROLE_SIDE: Record<string, Side> = {
 	JUDGE: "architect",
 	COORDINATOR: "architect",
 	PANEL: "architect",
+	PANEL_2: "architect",
 	CHAIRMAN: "architect",
 	ATTACKER: "architect",
 };
@@ -189,7 +222,7 @@ function isKnownRole(role: string): boolean {
 
 // ═══ 2. Roles ════════════════════════════════════════════════════════════════
 
-type Role = "ARCHITECT" | "BUILDER" | "FUSION" | "VALIDATOR" | "DEBATER_A" | "DEBATER_B" | "JUDGE" | "COORDINATOR" | "PANEL" | "CHAIRMAN" | "ATTACKER";
+type Role = "ARCHITECT" | "BUILDER" | "FUSION" | "VALIDATOR" | "DEBATER_A" | "DEBATER_B" | "JUDGE" | "COORDINATOR" | "PANEL" | "PANEL_2" | "CHAIRMAN" | "ATTACKER";
 
 /** One consistent color per role, everywhere (columns, footer, panels, errors). */
 const ROLE_COLOR: Record<Role, "accent" | "warning" | "success" | "mdLink"> = {
@@ -202,6 +235,7 @@ const ROLE_COLOR: Record<Role, "accent" | "warning" | "success" | "mdLink"> = {
 	JUDGE: "success",
 	COORDINATOR: "accent",
 	PANEL: "mdLink",
+	PANEL_2: "mdLink",
 	CHAIRMAN: "success",
 	ATTACKER: "warning",
 };
@@ -217,6 +251,7 @@ const ROLE_GLYPH: Record<Role, string> = {
 	JUDGE: "⚖",
 	COORDINATOR: "◎",
 	PANEL: "☰",
+	PANEL_2: "☷",
 	CHAIRMAN: "★",
 	ATTACKER: "✕",
 };
@@ -473,31 +508,49 @@ function parseStrictVerdictLine(text: string, prefix: string): string | undefine
 	return undefined;
 }
 
-/** Spawn config for a fresh ephemeral session: throwaway session dir inside the run's artifacts dir. */
+/** Spawn config for a fresh ephemeral session: throwaway session dir inside the run's artifacts dir.
+ *  Model ids contain `/` (provider/id) — sanitize so they don't nest directories or break Windows paths. */
 const ephemeralSpawn = (artifactsDir: string, label: string): { sessionDir: string } => ({
-	sessionDir: path.join(artifactsDir, label),
+	sessionDir: path.join(artifactsDir, label.replace(/[\\/<>:"|?*\u0000-\u001f]/g, "-")),
 });
+
+/**
+ * Windows CreateProcess caps the command line at ~32KB. Council ranking/chairman prompts
+ * (and large system prompts) blow past that when passed as argv. Offload to a file and
+ * pass `@path` — pi expands file arguments into the message (not context-files).
+ */
+const WIN_CMDLINE_SOFT_LIMIT = 24_000;
+function estimateCmdlineBytes(command: string, args: string[]): number {
+	// Node quotes/escapes args on Windows; budget ~3 bytes overhead per arg plus contents.
+	return Buffer.byteLength(command, "utf-8") + args.reduce((n, a) => n + Buffer.byteLength(a, "utf-8") + 3, 0);
+}
 
 /**
  * Compact one-line-per-run display for the live widget when more than two runs are active:
  * `glyph ROLE shortModel · status · last activity · tokens`
+ * On failure/timeout/abort, append the concrete error so a dead panelist is diagnosable live.
  */
 function compactRunLine(theme: any, r: AgentRun): string {
 	const now = Date.now();
 	const elapsed = r.startedAt ? (r.endedAt ?? now) - r.startedAt : 0;
+	const failed = r.status === "failed" || r.status === "timeout" || r.status === "aborted";
+	const errBit = failed ? runError(r).replace(/\s+/g, " ").trim().slice(0, 100) : "";
 	const state =
 		r.status === "pending" ? "waiting" :
 		r.status === "working" ? `${Math.floor(elapsed / 1000)}s` :
 		r.status === "done" ? `done ${fmtSecs(elapsed)}` :
+		errBit ? `${r.status} — ${errBit}` :
 		`${r.status}`;
 	const stateColor = r.status === "done" ? "success" : r.status === "working" ? ROLE_COLOR[r.role] : r.status === "pending" ? "dim" : "error";
 	const lastFlow = r.flow.length > 0 ? r.flow[r.flow.length - 1] : undefined;
 	let activity = "";
-	if (r.streamThinking) activity = "thinking…";
-	else if (r.streamText) activity = "answering…";
-	else if (lastFlow?.type === "tool") activity = lastFlow.label;
-	else if (lastFlow?.type === "thinking") activity = "thought";
-	else if (lastFlow?.type === "text") activity = "answered";
+	if (!failed) {
+		if (r.streamThinking) activity = "thinking…";
+		else if (r.streamText) activity = "answering…";
+		else if (lastFlow?.type === "tool") activity = lastFlow.label;
+		else if (lastFlow?.type === "thinking") activity = "thought";
+		else if (lastFlow?.type === "text") activity = "answered";
+	}
 	const tokens = r.tokensIn || r.tokensOut ? `in ${fmtK(r.tokensIn)} out ${fmtK(r.tokensOut)}` : "";
 	const bits = [
 		theme.fg(ROLE_COLOR[r.role], `${ROLE_GLYPH[r.role]} ${r.role}`),
@@ -645,14 +698,15 @@ function mdLines(text: string, colW: number): string[] {
 /** Council stage 1: parallel panelist answers (fresh ephemeral sessions). */
 async function councilPanelAnswers(opts: {
 	prompt: string;
-	panelModels: string[];
+	panelists: PanelistEntry[];
+	thinkingFor: (role: PanelSourceRole) => Thinking;
 	artifactsDir: string;
 	signal?: AbortSignal;
 	cwd: string;
 	timeoutMs: number;
 }): Promise<{ runs: AgentRun[]; survivors: number[]; answersBlock: string; letters: string[]; letterOf: (idx: number) => string }> {
-	const { prompt, panelModels, artifactsDir, signal, cwd, timeoutMs } = opts;
-	const panelRuns: AgentRun[] = panelModels.map((m) => newRun("PANEL", m));
+	const { prompt, panelists, thinkingFor, artifactsDir, signal, cwd, timeoutMs } = opts;
+	const panelRuns: AgentRun[] = panelists.map((p) => newRun(p.role, p.model));
 	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 	await Promise.all(
 		panelRuns.map((run) =>
@@ -660,7 +714,7 @@ async function councilPanelAnswers(opts: {
 				run,
 				prompt: fill("USER_PROMPT_COUNCIL_PANELIST.md", { PROMPT: prompt }),
 				tools: OPINION_TOOLS,
-				thinking: "medium",
+				thinking: thinkingFor(run.role as PanelSourceRole),
 				...ephemeralSpawn(artifactsDir, `panelist-${run.model}`),
 				cwd,
 				timeoutMs,
@@ -687,21 +741,22 @@ async function councilPanelAnswers(opts: {
 async function councilRanking(opts: {
 	prompt: string;
 	answersBlock: string;
-	panelModels: string[];
+	panelists: PanelistEntry[];
+	thinkingFor: (role: PanelSourceRole) => Thinking;
 	artifactsDir: string;
 	signal?: AbortSignal;
 	cwd: string;
 	timeoutMs: number;
 }): Promise<{ rankRuns: AgentRun[] }> {
-	const { prompt, answersBlock, panelModels, artifactsDir, signal, cwd, timeoutMs } = opts;
-	const rankRuns: AgentRun[] = panelModels.map((m) => newRun("PANEL", m));
+	const { prompt, answersBlock, panelists, thinkingFor, artifactsDir, signal, cwd, timeoutMs } = opts;
+	const rankRuns: AgentRun[] = panelists.map((p) => newRun(p.role, p.model));
 	await Promise.all(
 		rankRuns.map((run) =>
 			runChild({
 				run,
 				prompt: fill("USER_PROMPT_COUNCIL_RANKING.md", { PROMPT: prompt, ANSWERS: answersBlock }),
 				tools: OPINION_TOOLS,
-				thinking: "medium",
+				thinking: thinkingFor(run.role as PanelSourceRole),
 				...ephemeralSpawn(artifactsDir, `ranking-${run.model}`),
 				cwd,
 				timeoutMs,
@@ -721,7 +776,7 @@ function councilBorda(rankRuns: AgentRun[], validLetters: Set<string>, n: number
 	for (let ri = 0; ri < rankRuns.length; ri++) {
 		const r = rankRuns[ri]!;
 		if (!runOk(r)) {
-			excluded.push(`Panelist ${survivorIdx[ri]}: ranking failed`);
+			excluded.push(`${r.model}: ranking failed — ${runError(r)}`);
 			continue;
 		}
 		const ranked: string[] = [];
@@ -730,7 +785,7 @@ function councilBorda(rankRuns: AgentRun[], validLetters: Set<string>, n: number
 			if (m && validLetters.has(m[1]!)) ranked.push(m[1]!);
 		}
 		if (new Set(ranked).size !== n || ranked.length !== n) {
-			excluded.push(`Panelist ${survivorIdx[ri]}: malformed ranking`);
+			excluded.push(`${r.model}: malformed ranking`);
 			continue;
 		}
 		for (let pos = 0; pos < ranked.length; pos++) borda.set(ranked[pos]!, (borda.get(ranked[pos]!) ?? 0) + (n - pos));
@@ -1443,21 +1498,26 @@ async function redteamSortieLoop(opts: {
 /** Full council pipeline: panel answers → ranking → Borda → chairman. Returns chairman synthesis text. */
 async function councilPipeline(opts: {
 	prompt: string;
-	panelModels: string[];
+	panelists: PanelistEntry[];
 	chairmanModel: string;
+	thinkingFor: (role: PanelSourceRole) => Thinking;
 	artifactsDir: string;
 	signal?: AbortSignal;
 	cwd: string;
 	timeoutMs: number;
 }): Promise<{ synthesis: string; chairman: AgentRun; allRuns: AgentRun[] }> {
-	const { prompt, panelModels, chairmanModel, artifactsDir, signal, cwd, timeoutMs } = opts;
+	const { prompt, panelists, chairmanModel, thinkingFor, artifactsDir, signal, cwd, timeoutMs } = opts;
 	// Stage 1: panel answers
-	const { runs: panelRuns, survivors: survivorIdx, answersBlock, letterOf } = await councilPanelAnswers({ prompt, panelModels, artifactsDir, signal, cwd, timeoutMs });
+	const { runs: panelRuns, survivors: survivorIdx, answersBlock, letterOf } = await councilPanelAnswers({ prompt, panelists, thinkingFor, artifactsDir, signal, cwd, timeoutMs });
 	if (survivorIdx.length < 2) {
 		return { synthesis: "", chairman: newRun("CHAIRMAN", chairmanModel), allRuns: panelRuns };
 	}
-	// Stage 2: ranking
-	const { rankRuns } = await councilRanking({ prompt, answersBlock, panelModels, artifactsDir, signal, cwd, timeoutMs });
+	// Stage 2: ranking (survivors only; preserve source role from answer runs)
+	const survivorPanelists: PanelistEntry[] = survivorIdx.map((idx) => ({
+		model: panelRuns[idx]!.model,
+		role: panelRuns[idx]!.role as PanelSourceRole,
+	}));
+	const { rankRuns } = await councilRanking({ prompt, answersBlock, panelists: survivorPanelists, thinkingFor, artifactsDir, signal, cwd, timeoutMs });
 	// Stage 3a: Borda
 	const validLetters = new Set(survivorIdx.map((idx) => letterOf(idx)));
 	const { rankingTable, excluded } = councilBorda(rankRuns, validLetters, validLetters.size, survivorIdx);
@@ -1473,6 +1533,9 @@ async function councilPipeline(opts: {
  * Spawn one `pi --mode json -p` child agent and stream its JSON events into `run`.
  * Final answer = last assistant text part. The child writes its session into a
  * throwaway --session-dir under the run's /tmp artifacts dir.
+ *
+ * Prompts (and large system prompts) are written under sessionDir and passed as
+ * `@file` / path args so Windows never hits spawn ENAMETOOLONG on long briefs.
  */
 function runChild(opts: {
 	run: AgentRun; // mutated live
@@ -1490,6 +1553,20 @@ function runChild(opts: {
 }): Promise<AgentRun> {
 	const run = opts.run;
 	run.thinking = opts.thinking;
+
+	fs.mkdirSync(opts.sessionDir, { recursive: true });
+	const promptFile = path.join(opts.sessionDir, "child-prompt.md");
+	fs.writeFileSync(promptFile, opts.prompt, "utf-8");
+	// `@path` is pi's file-argument syntax — contents are merged into the user message.
+	const promptArg = `@${promptFile}`;
+
+	let systemPromptArg = opts.systemPrompt;
+	if (opts.systemPrompt && Buffer.byteLength(opts.systemPrompt, "utf-8") > 400) {
+		const spFile = path.join(opts.sessionDir, "child-system-prompt.md");
+		fs.writeFileSync(spFile, opts.systemPrompt, "utf-8");
+		systemPromptArg = spFile; // --system-prompt accepts a file path
+	}
+
 	// Clean-room spawn: children never load skills, extensions (recursion guard), or
 	// context files — their entire contract comes from the harness's prompt files.
 	const args: string[] = [
@@ -1510,10 +1587,10 @@ function runChild(opts: {
 	if (opts.fork) args.push("--fork", opts.fork);
 	else if (opts.resume) args.push("--session", opts.resume);
 	else if (opts.sessionId) args.push("--session-id", opts.sessionId);
-	if (opts.systemPrompt) args.push("--system-prompt", opts.systemPrompt);
+	if (systemPromptArg) args.push("--system-prompt", systemPromptArg);
 	if (opts.tools === "none") args.push("--no-tools");
 	else args.push("--tools", opts.tools);
-	args.push(opts.prompt);
+	args.push(promptArg);
 
 	return new Promise<AgentRun>((resolve) => {
 		const started = Date.now();
@@ -1609,14 +1686,41 @@ function runChild(opts: {
 			run.streamText = "";
 		};
 
+		const failSpawn = (err: unknown) => {
+			const msg = err instanceof Error ? `${err.message}${ (err as NodeJS.ErrnoException).code ? ` (${(err as NodeJS.ErrnoException).code})` : ""}` : String(err);
+			run.stderr += `\nspawn error: ${msg}`;
+			run.errorMessage = msg;
+			run.exitCode = 1;
+			settle();
+			resolve(run);
+		};
+
 		const invocation = piInvocation(args);
-		const proc = spawn(invocation.command, invocation.args, {
-			cwd: opts.cwd,
-			shell: false,
-			stdio: ["ignore", "pipe", "pipe"],
-			// Children still make their real model API calls — this only skips startup chores.
-			env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" },
-		});
+		const cmdlineBytes = estimateCmdlineBytes(invocation.command, invocation.args);
+		if (cmdlineBytes > WIN_CMDLINE_SOFT_LIMIT) {
+			// Still too long after prompt offload (e.g. enormous --fork path + system prompt):
+			// surface a clear failure instead of an uncaught ENAMETOOLONG that kills the command.
+			failSpawn(
+				new Error(
+					`command line too long (~${cmdlineBytes} bytes; Windows limit ~32767). Prompt was offloaded to ${promptFile}; shorten --system-prompt / paths or reduce panel size.`,
+				),
+			);
+			return;
+		}
+
+		let proc: ReturnType<typeof spawn>;
+		try {
+			proc = spawn(invocation.command, invocation.args, {
+				cwd: opts.cwd,
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+				// Children still make their real model API calls — this only skips startup chores.
+				env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" },
+			});
+		} catch (err) {
+			failSpawn(err);
+			return;
+		}
 
 		// Line-buffer stdout: events arrive one JSON object per line, possibly split across chunks.
 		proc.stdout?.on("data", (data: Buffer) => {
@@ -1663,11 +1767,8 @@ function runChild(opts: {
 			resolve(run);
 		});
 		proc.on("error", (err) => {
-			run.stderr += `\nspawn error: ${String(err)}`;
-			run.exitCode = 1;
 			cleanup();
-			settle();
-			resolve(run);
+			failSpawn(err);
 		});
 
 		// Wall-clock timeout: same SIGTERM → SIGKILL escalation as the abort path.
@@ -2017,7 +2118,7 @@ class CastSheet implements Component {
 	private manualInput = new Input();
 	private savedMsg = "";
 	private settled = false; // guard: done() called exactly once
-	private maxListRows = 14;
+	private maxListRows = 12;
 
 	constructor(init: CastSheetInit) {
 		this.tui = init.tui;
@@ -2051,6 +2152,17 @@ class CastSheet implements Component {
 		this.filter = "";
 		this.drillIndex = 0;
 		this.drillScroll = 0;
+		// Materialize inherited/default into working so multi-pick checkboxes match the row.
+		if (this.multiPick.includes(role) && !this.working[role]?.model?.trim()) {
+			const shown = this.roleModel(role)
+				.split(",")
+				.map((s) => s.trim())
+				.filter(Boolean);
+			if (shown.length) {
+				const prev = this.working[role];
+				this.working[role] = { model: shown.join(","), ...(prev?.thinking ? { thinking: prev.thinking } : {}) };
+			}
+		}
 		this.rebuildItems();
 		this.rerender();
 	}
@@ -2098,7 +2210,9 @@ class CastSheet implements Component {
 
 	private rerender() {
 		try {
-			this.tui.requestRender();
+			// force=true clears previousLines — without it, Windows Terminal wide-glyph
+			// mismatches leave ghost rows (PANEL/CHAIRMAN appearing duplicated on ↓).
+			this.tui.requestRender(true);
 		} catch {
 			/* overlay already disposed */
 		}
@@ -2187,13 +2301,8 @@ class CastSheet implements Component {
 
 	private handleDrill(data: string) {
 		if (matchesKey(data, "return")) {
-			// Multi-pick: Enter confirms selection and returns to rows (Space toggles).
-			// Single-pick: Enter assigns the highlighted model and returns.
-			if (this.multiPick.includes(this.drillRole)) {
-				this.mode = "rows";
-				this.rerender();
-				return;
-			}
+			// Both single- and multi-pick: Enter picks the highlighted model.
+			// Multi-pick toggles and stays in the drill (Esc / ⌫ with empty filter = done).
 			const list = this.filteredItems();
 			const it = list[this.drillIndex];
 			if (it) this.pick(it.model);
@@ -2219,11 +2328,12 @@ class CastSheet implements Component {
 			this.drillIndex = Math.min(list.length - 1, this.drillIndex + 1);
 			this.clampDrill();
 			this.rerender();
-		} else if (matchesKey(data, "space") && this.multiPick.includes(this.drillRole)) {
+		} else if ((matchesKey(data, "space") || data === " ") && this.multiPick.includes(this.drillRole)) {
 			const list = this.filteredItems();
 			const it = list[this.drillIndex];
 			if (it) this.pick(it.model);
-		} else if (data.length === 1 && data.charCodeAt(0) >= 32) {
+		} else if (data.length === 1 && data.charCodeAt(0) > 32) {
+			// > 32: exclude space (already handled for multi-pick); don't pollute the filter
 			this.filter += data;
 			this.clampDrill();
 			this.rerender();
@@ -2261,7 +2371,13 @@ class CastSheet implements Component {
 	}
 
 	private doRun() {
+		// Persist on RUN so a mid-session extension reload doesn't wipe the cast.
 		this.onCommit(this.working);
+		try {
+			this.onSave(this.working);
+		} catch {
+			/* disk errors shouldn't block the run — session cast is already committed */
+		}
 		this.finish("run");
 	}
 	private doSave() {
@@ -2287,68 +2403,68 @@ class CastSheet implements Component {
 	}
 
 	private renderRows(width: number): string[] {
-		const innerW = Math.max(40, Math.min(width - 2, 92));
+		// Keep the whole box (borders included) inside the overlay width so pi-tui never wraps lines.
+		const innerW = Math.max(40, Math.min(Math.max(1, width - 2), 92));
 		const lines: string[] = [];
-		const head = this.command ? `CAST · /${this.command}` : "CAST · /roles";
+		const head = this.command ? `CAST /${this.command}` : "CAST /roles";
 		lines.push(themelessHeader(head, innerW));
-		lines.push(`  role         model                                          thinking   auth`);
-		lines.push(`  ${"─".repeat(innerW - 2)}`);
+		lines.push(padVisible("  role         model                                      thinking  auth", innerW));
+		lines.push(`  ${"-".repeat(Math.max(0, innerW - 2))}`);
 		this.roles.forEach((role, i) => {
-			const sel = i === this.cursor ? "▸ " : "  ";
+			const sel = i === this.cursor ? "> " : "  ";
 			const auth = this.authMarker(role);
 			const rawModel = this.roleModel(role);
 			const multi = this.multiPick.includes(role);
-			const modelLabel = multi
-				? (() => {
-						const n = rawModel.split(",").map((s) => s.trim()).filter(Boolean).length;
-						return n > 1 ? `${n} models: ${rawModel}` : rawModel;
-					})()
-				: rawModel;
-			const model = truncateToWidth(modelLabel, 44);
-			const th = truncateToWidth(this.roleThinkingDisplay(role), 10);
-			const name = truncateToWidth(`${ROLE_GLYPH[role]} ${role}`.padEnd(12), 12);
-			lines.push(`${sel}${name} ${model.padEnd(44)} ${th.padEnd(10)} ${auth}`);
+			const n = multi ? rawModel.split(",").map((s) => s.trim()).filter(Boolean).length : 0;
+			// ASCII only — ROLE_GLYPH (☰/★/…) is ambiguous-width on Windows Terminal and
+			// makes lines wrap, which then ghosts as duplicate PANEL/CHAIRMAN rows.
+			const modelLabel = multi && n > 1 ? `${n}x ${rawModel}` : rawModel;
+			const name = padVisible(truncateToWidth(role, 12), 12);
+			const model = padVisible(truncateToWidth(modelLabel, 42), 42);
+			const th = padVisible(truncateToWidth(this.roleThinkingDisplay(role), 9), 9);
+			lines.push(`${sel}${name} ${model} ${th} ${auth}`);
 		});
-		lines.push(`  ${"─".repeat(innerW - 2)}`);
-		const saveSel = this.cursor === this.roles.length ? "▸ " : "  ";
-		const runSel = this.cursor === this.roles.length + 1 ? "▸ " : "  ";
-		lines.push(`${saveSel}[S] SAVE cast to ${CAST_FILE}`);
-		lines.push(`${runSel}[⏎] RUN with this cast`);
+		lines.push(`  ${"-".repeat(Math.max(0, innerW - 2))}`);
+		const saveSel = this.cursor === this.roles.length ? "> " : "  ";
+		const runSel = this.cursor === this.roles.length + 1 ? "> " : "  ";
+		lines.push(`${saveSel}[S] SAVE to ${CAST_FILE}`);
+		lines.push(`${runSel}[Enter] RUN (saves cast)`);
 		lines.push("");
-		lines.push(`  ↑↓ move · ⏎/e edit row · m manual · t thinking · S save · Esc cancel${this.savedMsg ? `   ✓ ${this.savedMsg}` : ""}`);
+		lines.push(`  up/down move · Enter/e edit · m manual · t thinking · Esc cancel${this.savedMsg ? `  OK ${this.savedMsg}` : ""}`);
 		return borderBox(lines, innerW);
 	}
 
 	private renderDrill(width: number): string[] {
-		const innerW = Math.max(40, Math.min(width - 2, 92));
+		const innerW = Math.max(40, Math.min(Math.max(1, width - 2), 92));
 		const list = this.filteredItems();
 		const multi = this.multiPick.includes(this.drillRole);
 		const picked = multi ? this.curMultiSet().size : 0;
 		const lines: string[] = [
 			themelessHeader(
 				multi
-					? `${ROLE_GLYPH[this.drillRole]} ${this.drillRole} · multi-pick (${picked} selected)`
-					: `${ROLE_GLYPH[this.drillRole]} ${this.drillRole} · pick a model`,
+					? `${this.drillRole} multi-pick (${picked} selected)`
+					: `${this.drillRole} pick a model`,
 				innerW,
 			),
-			`  filter: ${this.filter}${this.filter ? "_" : ""}   (${list.length} match${list.length === 1 ? "" : "s"}${multi ? " · space toggles · ⏎ done" : " · ⏎ select"})`,
-			`  ${"─".repeat(innerW - 2)}`,
+			`  filter: ${this.filter}${this.filter ? "_" : ""}   (${list.length} match${list.length === 1 ? "" : "es"}${multi ? ` · ${picked} selected · Enter/space toggle · Esc done` : " · Enter select"})`,
+			`  ${"-".repeat(Math.max(0, innerW - 2))}`,
 		];
 		const visible = list.slice(this.drillScroll, this.drillScroll + this.maxListRows);
 		visible.forEach((it, vi) => {
 			const idx = this.drillScroll + vi;
-			const sel = idx === this.drillIndex ? "▸ " : "  ";
-			const box = multi ? (it.selected ? "☑" : "☐") : (it.selected ? "●" : " ");
-			const auth = it.authed ? "✓" : "✗";
-			const model = truncateToWidth(`${it.provider}/${it.id}`, 40);
-			const name = truncateToWidth(it.name, innerW - 40 - 12);
-			lines.push(`${sel}${box} ${auth} ${model.padEnd(40)} ${name}`);
+			const sel = idx === this.drillIndex ? "> " : "  ";
+			const box = multi ? (it.selected ? "[x]" : "[ ]") : (it.selected ? "*" : " ");
+			const auth = it.authed ? "y" : "n";
+			const model = padVisible(truncateToWidth(`${it.provider}/${it.id}`, 40), 40);
+			const nameBudget = Math.max(8, innerW - 2 - visibleWidth(`${sel}${box} ${auth} ${model} `));
+			const name = truncateToWidth(it.name, nameBudget);
+			lines.push(`${sel}${box} ${auth} ${model} ${name}`);
 		});
 		for (let i = visible.length; i < this.maxListRows; i++) lines.push("");
-		lines.push(`  ${"─".repeat(innerW - 2)}`);
+		lines.push(`  ${"-".repeat(Math.max(0, innerW - 2))}`);
 		lines.push(multi
-			? "  type to filter · ↑↓ move · space toggle · ⏎ done · ⌫ back · Esc cancel"
-			: "  type to filter · ↑↓ move · ⏎ select · ⌫ back · Esc cancel");
+			? "  type to filter · up/down · Enter/space toggle · Esc/Backspace done"
+			: "  type to filter · up/down · Enter select · Backspace back · Esc cancel");
 		return borderBox(lines, innerW);
 	}
 
@@ -2361,12 +2477,12 @@ class CastSheet implements Component {
 			"  Type a literal provider/id (for catalog-lagged models):",
 			`  > ${inputLine}`,
 			"",
-			"  ⏎ confirm · Esc cancel",
+			"  Enter confirm · Esc cancel",
 		];
 		return borderBox(lines, innerW);
 	}
 
-	/** Auth marker for a row: ✓ authed, ✗ missing, ? unknown (registry absent). */
+	/** Auth marker for a row: y=ok, n=missing/unauthed, ?=unknown. ASCII-only for Windows Terminal. */
 	private authMarker(role: Role): string {
 		try {
 			const models = expandCastModels(role, this.roleModel(role));
@@ -2374,18 +2490,18 @@ class CastSheet implements Component {
 			let anyUnknown = false;
 			for (const model of models) {
 				const slash = model.indexOf("/");
-				if (slash < 1) return "✗";
+				if (slash < 1) return "n";
 				const provider = model.slice(0, slash);
 				const id = model.slice(slash + 1);
-				if (!provider || !id) return "✗";
+				if (!provider || !id) return "n";
 				const found = this.reg?.find?.(provider, id);
 				if (!found) {
 					anyUnknown = true;
 					continue;
 				}
-				if (!(this.reg?.hasConfiguredAuth?.(found) ?? true)) return "✗";
+				if (!(this.reg?.hasConfiguredAuth?.(found) ?? true)) return "n";
 			}
-			return anyUnknown ? "✗" : "✓";
+			return anyUnknown ? "n" : "y";
 		} catch {
 			return "?";
 		}
@@ -2398,12 +2514,25 @@ function themelessHeader(title: string, width: number): string {
 	const left = Math.floor(pad / 2);
 	return ` ${" ".repeat(left)}${title}${" ".repeat(pad - left)}`;
 }
-/** Wrap rendered lines in a simple Unicode border box of the given inner width. */
+
+/** Pad a string to a target *visible* column width (String.padEnd breaks on wide glyphs). */
+function padVisible(s: string, width: number): string {
+	const w = visibleWidth(s);
+	if (w >= width) return s;
+	return s + " ".repeat(width - w);
+}
+
+/** Wrap rendered lines in a simple ASCII border box of the given inner width.
+ *  Avoids Unicode box-drawing — ambiguous width on Windows Terminal caused wrap ghosts. */
 function borderBox(lines: string[], innerW: number): string[] {
-	const top = `╭${"─".repeat(innerW)}╮`;
-	const bot = `╰${"─".repeat(innerW)}╯`;
-	const body = lines.map((l) => `│${truncateToWidth(l || "", innerW, "", true).padEnd(innerW)}│`);
-	return [top, ...body, bot];
+	const top = `+${"-".repeat(innerW)}+`;
+	const bot = `+${"-".repeat(innerW)}+`;
+	const body = lines.map((l) => {
+		const clipped = truncateToWidth(l || "", innerW, "", true);
+		return `|${padVisible(clipped, innerW)}|`;
+	});
+	// Final safety: never emit a line wider than innerW+2 (the chrome).
+	return [top, ...body, bot].map((l) => (visibleWidth(l) > innerW + 2 ? truncateToWidth(l, innerW + 2) : l));
 }
 
 // ═══ 7c. Artifact utilities (global for stage functions) ════════════════════
@@ -3142,6 +3271,13 @@ export default function (pi: ExtensionAPI) {
 			case "coord":
 			case "redteam": {
 				add(new Text(theme.fg("customMessageLabel", theme.bold(`FUSION HARNESS · /${d.command ?? "?"}`)) + (d.ok ? "" : theme.fg("error", theme.bold(" — ISSUES FOUND"))), 1, 0));
+				const failedSources = (d.sources ?? []).filter((s) => s.error);
+				if (failedSources.length) {
+					blank();
+					for (const s of failedSources) {
+						add(new Text(theme.fg("error", `  ✗ ${ROLE_GLYPH[s.role]} ${s.role} · ${shortModel(s.model)} — ${s.error}`), 1, 0));
+					}
+				}
 				blank();
 				md(content);
 				break;
@@ -3441,21 +3577,23 @@ export default function (pi: ExtensionAPI) {
 	const openCastSheet = async (ctx: any, roles: Role[], opts: { command?: string; multiPick?: Role[] } = {}): Promise<"run" | "cancel"> => {
 		seedCast(ctx.cwd);
 		const ui = ctx.ui as unknown as ExtensionUIContext;
+		// Deep-clone so CastSheet mutations never alias into the live session cast until commit.
+		const working: Cast = JSON.parse(JSON.stringify(cast));
 		const result = await ui.custom<"run" | "cancel">(
 			(tui: TUI, _theme: any, _kb: any, done) =>
 				new CastSheet({
 					tui,
-					roles,
-					working: { ...cast },
+					roles: [...roles],
+					working,
 					modelRegistry: ctx.modelRegistry,
 					cwd: ctx.cwd,
 					command: opts.command,
-					multiPick: opts.multiPick ?? [],
-					onCommit: (next: Cast) => Object.assign(cast, next),
+					multiPick: [...(opts.multiPick ?? [])],
+					onCommit: (next: Cast) => setCast(next),
 					onSave: (next: Cast) => saveProjectCastUsing(ctx.cwd, next),
 					done,
 				}),
-			{ overlay: true, overlayOptions: { anchor: "center", width: 78, maxHeight: 24 } },
+			{ overlay: true, overlayOptions: { anchor: "center", width: 78, maxHeight: 30 } },
 		);
 		return result ?? "cancel";
 	};
@@ -3466,9 +3604,9 @@ export default function (pi: ExtensionAPI) {
 		parallel: ["ARCHITECT", "BUILDER"],
 		debate: ["DEBATER_A", "DEBATER_B", "JUDGE"],
 		coordinate: ["COORDINATOR"],
-		council: ["PANEL", "CHAIRMAN"],
+		council: ["PANEL", "PANEL_2", "CHAIRMAN"],
 		redteam: ["ATTACKER", "BUILDER"],
-		gauntlet: ["PANEL", "CHAIRMAN", "VALIDATOR", "COORDINATOR", "BUILDER", "ATTACKER"],
+		gauntlet: ["PANEL", "PANEL_2", "CHAIRMAN", "VALIDATOR", "COORDINATOR", "BUILDER", "ATTACKER"],
 	};
 	const runCastGate = async (ctx: any, command: string, skip: boolean): Promise<boolean> => {
 		const roles = COMMAND_CAST[command] ?? KNOWN_ROLES;
@@ -4453,25 +4591,42 @@ export default function (pi: ExtensionAPI) {
 			const prompt = (rest ?? "").trim();
 			if (!prompt) { ctx.ui.notify("Usage: /council <prompt>", "warning"); return; }
 			if (!(await runCastGate(ctx, "council", skip))) return;
-			const panelModels = expandCastModels("PANEL", cast["PANEL"]?.model ?? castModel("ARCHITECT"));
-			if (panelModels.length < 2) { ctx.ui.notify("Council requires at least 2 panelists. Use /roles to set PANEL (multi-pick).", "error"); return; }
+			const panelists = collectPanelModels(cast, castModel);
+			if (panelists.length < 2) {
+				ctx.ui.notify(
+					"Council requires at least 2 panelists. Use /roles to set PANEL and/or PANEL_2 (multi-pick).",
+					"error",
+				);
+				return;
+			}
+			const panelModels = panelists.map((p) => p.model);
 			const cModel = castModel("CHAIRMAN");
 			const startedAt = Date.now();
 			const artifactsDir = await mkArtifacts();
 			await save(artifactsDir, "prompt.md", prompt);
 			panel({ kind: "prompt", command: "council", ok: true }, `/council ${prompt}`);
-			panel({ kind: "banner", command: "council", ok: true, prompt, roles: [...panelModels.map((m: string) => ({ role: "PANEL" as Role, model: m })), { role: "CHAIRMAN", model: cModel }], artifactsDir }, "");
-			const panelRuns: AgentRun[] = panelModels.map((m: string) => newRun("PANEL", m));
+			panel({ kind: "banner", command: "council", ok: true, prompt, roles: [...panelists.map((p) => ({ role: p.role as Role, model: p.model })), { role: "CHAIRMAN", model: cModel }], artifactsDir }, "");
+			const panelRuns: AgentRun[] = panelists.map((p) => newRun(p.role, p.model));
 			const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 			const stopper = startStoppable(ctx, "council");
 			const stopWidget = startWidget(ctx, "council", panelRuns, undefined, startedAt);
 			try {
 				// Stage 1: parallel answers (fresh ephemeral)
-				ctx.ui.setStatus(CUSTOM_TYPE, `council: stage 1 — ${panelModels.length} panelists answering…`);
-				await Promise.all(panelRuns.map((run) => runChild({ run, prompt: fill("USER_PROMPT_COUNCIL_PANELIST.md", { PROMPT: prompt }), tools: OPINION_TOOLS, thinking: castThinking("PANEL"), ...ephemeralSpawn(artifactsDir, `panelist-${run.model}`), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal })));
+				ctx.ui.setStatus(CUSTOM_TYPE, `council: stage 1 — ${panelists.length} panelists answering…`);
+				await Promise.all(panelRuns.map((run) => runChild({ run, prompt: fill("USER_PROMPT_COUNCIL_PANELIST.md", { PROMPT: prompt }), tools: OPINION_TOOLS, thinking: castThinking(run.role as PanelSourceRole), ...ephemeralSpawn(artifactsDir, `panelist-${run.model}`), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal })));
 				if (stopper.stopped()) { stoppedPanel("council", panelRuns, artifactsDir, startedAt, "Stopped during stage 1."); return; }
 				const survivors = panelRuns.filter(runOk);
-				if (survivors.length < 2) { panel({ kind: "error", command: "council", ok: false, sources: panelRuns.map(toStat), artifactsDir }, `Council failed: only ${survivors.length} survived (min 2).`); return; }
+				const failedPanel = panelRuns.filter((r) => !runOk(r));
+				const failDigest = failedPanel.length
+					? `\n\n### Failed panelists\n${failedPanel.map((r) => `- ✗ **${r.model}**: ${runError(r)}`).join("\n")}`
+					: "";
+				if (survivors.length < 2) {
+					panel(
+						{ kind: "error", command: "council", ok: false, sources: panelRuns.map(toStat), artifactsDir },
+						`Council failed: only ${survivors.length} of ${panelRuns.length} panelists survived (min 2).${failDigest}`,
+					);
+					return;
+				}
 				for (let i = 0; i < panelRuns.length; i++) await save(artifactsDir, `panel-answer-${i}.md`, runOk(panelRuns[i]!) ? panelRuns[i]!.text : `FAILED: ${runError(panelRuns[i]!)}`);
 				// Stage 2: anonymize + rank
 				const survivorIdx = panelRuns.map((r, i) => (runOk(r) ? i : -1)).filter((i) => i >= 0);
@@ -4481,8 +4636,8 @@ export default function (pi: ExtensionAPI) {
 			const answersBlock = answers.map((a) => `### Response ${a.letter}\n${a.text}`).join("\n\n");
 				await save(artifactsDir, "anonymized-answers.md", answersBlock);
 				ctx.ui.setStatus(CUSTOM_TYPE, `council: stage 2 — ranking…`);
-				const rankRuns: AgentRun[] = survivorIdx.map((idx) => newRun("PANEL", panelRuns[idx]!.model));
-				await Promise.all(rankRuns.map((run) => runChild({ run, prompt: fill("USER_PROMPT_COUNCIL_RANKING.md", { PROMPT: prompt, ANSWERS: answersBlock }), tools: OPINION_TOOLS, thinking: castThinking("PANEL"), ...ephemeralSpawn(artifactsDir, `ranking-${run.model}`), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal })));
+				const rankRuns: AgentRun[] = survivorIdx.map((idx) => newRun(panelRuns[idx]!.role, panelRuns[idx]!.model));
+				await Promise.all(rankRuns.map((run) => runChild({ run, prompt: fill("USER_PROMPT_COUNCIL_RANKING.md", { PROMPT: prompt, ANSWERS: answersBlock }), tools: OPINION_TOOLS, thinking: castThinking(run.role as PanelSourceRole), ...ephemeralSpawn(artifactsDir, `ranking-${run.model}`), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal })));
 				if (stopper.stopped()) { stoppedPanel("council", [...panelRuns, ...rankRuns], artifactsDir, startedAt, "Stopped during stage 2."); return; }
 				// Stage 3: Borda aggregation + chairman
 				ctx.ui.setStatus(CUSTOM_TYPE, "council: stage 3 — aggregating + chairman…");
@@ -4493,10 +4648,10 @@ export default function (pi: ExtensionAPI) {
 				const excluded: string[] = [];
 				for (let ri = 0; ri < rankRuns.length; ri++) {
 					const r = rankRuns[ri]!;
-					if (!runOk(r)) { excluded.push(`Panelist ${survivorIdx[ri]}: ranking failed`); continue; }
+					if (!runOk(r)) { excluded.push(`${r.model}: ranking failed — ${runError(r)}`); continue; }
 					const ranked: string[] = [];
 					for (const line of r.text.split("\n")) { const m = line.trim().match(/^([A-Z])\s*—/); if (m && validLetters.has(m[1]!)) ranked.push(m[1]!); }
-					if (new Set(ranked).size !== n || ranked.length !== n) { excluded.push(`Panelist ${survivorIdx[ri]}: malformed ranking`); continue; }
+					if (new Set(ranked).size !== n || ranked.length !== n) { excluded.push(`${r.model}: malformed ranking`); continue; }
 					for (let pos = 0; pos < ranked.length; pos++) borda.set(ranked[pos]!, (borda.get(ranked[pos]!) ?? 0) + (n - pos));
 				}
 				const rankingTable = [...borda.entries()].sort((a, b) => b[1] - a[1]).map(([l, s], i) => `${i + 1}. Response ${l} — ${s} pts`).join("\n");
@@ -4505,7 +4660,7 @@ export default function (pi: ExtensionAPI) {
 				await runChild({ run: chairman, prompt: fill("USER_PROMPT_COUNCIL_CHAIRMAN.md", { PROMPT: prompt, ANSWERS: answersBlock, RANKING_TABLE: rankingTable + exclNote }), tools: READONLY_TOOLS, thinking: castThinking("CHAIRMAN"), ...ephemeralSpawn(artifactsDir, "chairman"), cwd: ctx.cwd, timeoutMs: childTimeoutMs(), signal: stopper.signal });
 				await save(artifactsDir, "chairman.md", runOk(chairman) ? chairman.text : `FAILED: ${runError(chairman)}`);
 				const allRuns = [...panelRuns, ...rankRuns, chairman]; const t = totals(allRuns, startedAt); const ok = runOk(chairman);
-				panel({ kind: "council", command: "council", ok, sources: [...panelRuns.map(toStat), toStat(chairman)], artifactsDir, ...t }, [`## Council: ${prompt.slice(0, 100)}`, ``, `**Panel:** ${panelModels.length} (${survivors.length} survived) · **Chairman:** ${cModel}`, ``, `### Panel Answers`, answersBlock, ``, `### Aggregate Ranking (Borda)`, rankingTable, exclNote, ``, `### Chairman Synthesis`, ok ? chairman.text : `Chairman failed: ${runError(chairman)}`].join("\n"));
+				panel({ kind: "council", command: "council", ok, sources: [...panelRuns.map(toStat), toStat(chairman)], artifactsDir, ...t }, [`## Council: ${prompt.slice(0, 100)}`, ``, `**Panel:** ${panelModels.length} (${survivors.length} survived${failedPanel.length ? `, ${failedPanel.length} failed` : ""}) · **Chairman:** ${cModel}`, failDigest, ``, `### Panel Answers`, answersBlock, ``, `### Aggregate Ranking (Borda)`, rankingTable, exclNote, ``, `### Chairman Synthesis`, ok ? chairman.text : `Chairman failed: ${runError(chairman)}`].join("\n"));
 				await save(artifactsDir, "summary.json", JSON.stringify({ command: "council", ok, panelModels, survivors: survivors.length, chairman: cModel, agents: allRuns.map(toStat), sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t }, null, 2));
 			} finally { stopper.release(); stopWidget(); ctx.ui.setStatus(CUSTOM_TYPE, undefined); }
 		},
@@ -5044,12 +5199,18 @@ export default function (pi: ExtensionAPI) {
 						stage.artifacts["plan.md"] = path.join(dir, "plan.md");
 					} else {
 						// Council pipeline
-						const panelModels = expandCastModels("PANEL", cast["PANEL"]?.model ?? castModel("ARCHITECT"));
+						const panelists = collectPanelModels(cast, castModel);
+						if (panelists.length < 2) {
+							throw new Error(
+								"Council deliberate requires at least 2 panelists. Use /roles to set PANEL and/or PANEL_2 (multi-pick).",
+							);
+						}
 						const cModel = castModel("CHAIRMAN");
 						const { synthesis } = await councilPipeline({
 							prompt,
-							panelModels,
+							panelists,
 							chairmanModel: cModel,
+							thinkingFor: (role) => castThinking(role),
 							artifactsDir: dir,
 							signal: stopper.signal,
 							cwd: ctx.cwd,
@@ -5297,6 +5458,7 @@ export default function (pi: ExtensionAPI) {
 			switch (s) {
 				case "deliberate":
 					roles.add("PANEL");
+					roles.add("PANEL_2");
 					roles.add("CHAIRMAN");
 					roles.add("DEBATER_A");
 					roles.add("DEBATER_B");

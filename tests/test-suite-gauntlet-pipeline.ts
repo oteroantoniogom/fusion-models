@@ -70,6 +70,7 @@ const stageRoles = (stages: ChainStage[]): Role[] => {
 		switch (s) {
 			case "deliberate":
 				roles.add("PANEL");
+				roles.add("PANEL_2");
 				roles.add("CHAIRMAN");
 				roles.add("DEBATER_A");
 				roles.add("DEBATER_B");
@@ -261,14 +262,15 @@ test("STAGE_PREREQS: integrate requires plan.md", () => {
 
 // ── 3. Stage Roles Union ───────────────────────────────────────────────────
 
-test("stageRoles: deliberate adds PANEL, CHAIRMAN, DEBATER_A/B, JUDGE", () => {
+test("stageRoles: deliberate adds PANEL, PANEL_2, CHAIRMAN, DEBATER_A/B, JUDGE", () => {
 	const roles = stageRoles(["deliberate"]);
 	assert.ok(roles.includes("PANEL"));
+	assert.ok(roles.includes("PANEL_2"));
 	assert.ok(roles.includes("CHAIRMAN"));
 	assert.ok(roles.includes("DEBATER_A"));
 	assert.ok(roles.includes("DEBATER_B"));
 	assert.ok(roles.includes("JUDGE"));
-	assert.strictEqual(roles.length, 5);
+	assert.strictEqual(roles.length, 6);
 });
 
 test("stageRoles: gate adds VALIDATOR and BUILDER", () => {
@@ -312,7 +314,7 @@ test("stageRoles: integrate adds COORDINATOR", () => {
 
 test("stageRoles: full gauntlet chain includes all roles", () => {
 	const roles = stageRoles(["deliberate", "gate", "decompose", "build", "verify", "harden", "integrate"]);
-	const expected = ["PANEL", "CHAIRMAN", "DEBATER_A", "DEBATER_B", "JUDGE", "VALIDATOR", "BUILDER", "COORDINATOR", "ATTACKER"];
+	const expected = ["PANEL", "PANEL_2", "CHAIRMAN", "DEBATER_A", "DEBATER_B", "JUDGE", "VALIDATOR", "BUILDER", "COORDINATOR", "ATTACKER"];
 	for (const r of expected) {
 		assert.ok(roles.includes(r), `missing role ${r}`);
 	}
@@ -653,7 +655,28 @@ test("fusion-harness.ts COMMAND_CAST includes gauntlet", () => {
 	);
 	assert.ok(src.includes("gauntlet:"), "gauntlet not in COMMAND_CAST");
 	assert.ok(src.includes("PANEL"), "gauntlet cast missing PANEL");
+	assert.ok(src.includes("PANEL_2"), "gauntlet cast missing PANEL_2");
 	assert.ok(src.includes("ATTACKER"), "gauntlet cast missing ATTACKER");
+});
+
+test("fusion-harness.ts stageRoles deliberate includes PANEL_2", () => {
+	const src = fs.readFileSync(
+		path.join(__dirname, "..", "extensions", "fusion-harness", "fusion-harness.ts"),
+		"utf-8",
+	);
+	const start = src.indexOf("const stageRoles = ");
+	assert.ok(start > 0, "stageRoles not found");
+	const end = src.indexOf("return [...roles];", start);
+	assert.ok(/roles\.add\(\s*["']PANEL_2["']\s*\)/.test(src.slice(start, end)), "stageRoles missing PANEL_2");
+});
+
+test("README.md documents PANEL_2", () => {
+	const readme = fs.readFileSync(
+		path.join(__dirname, "..", "README.md"),
+		"utf-8",
+	);
+	assert.ok(readme.includes("PANEL_2"), "README missing PANEL_2");
+	assert.ok(readme.includes("☷"), "README missing PANEL_2 glyph");
 });
 
 test("README.md documents /gauntlet", () => {
