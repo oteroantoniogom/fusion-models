@@ -36,6 +36,12 @@ const src = fs.readFileSync(SRC, "utf-8");
 const README = path.join(ROOT, "README.md");
 const readme = fs.readFileSync(README, "utf-8");
 
+/** Extract runGauntletStage body; CRLF-tolerant (Windows checkouts). */
+const extractRunGauntletStage = (source: string): string | null => {
+	const m = source.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
+	return m ? m[0]! : null;
+};
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // FAITHFUL EXTRACTIONS — copied from fusion-harness.ts gauntlet section.
 // These are tested for correctness AND cross-referenced against source.
@@ -229,22 +235,28 @@ test("1.12 accumulateCost in source", () => {
 	assert.ok(src.includes('const accumulateCost = ('), "accumulateCost missing");
 });
 
-test("1.13 COMMAND_CAST has gauntlet entry with 6 roles", () => {
+test("1.13 COMMAND_CAST has gauntlet entry with 7 roles including PANEL_2", () => {
 	const match = src.match(/gauntlet:\s*\[([^\]]+)\]/);
 	assert.ok(match, "gauntlet entry not found in COMMAND_CAST");
 	const roles = match![1]!.split(",").map((r) => r.trim().replace(/'/g, '"'));
-	assert.strictEqual(roles.length, 6);
-	for (const r of ['"PANEL"', '"CHAIRMAN"', '"VALIDATOR"', '"COORDINATOR"', '"BUILDER"', '"ATTACKER"']) {
+	assert.strictEqual(roles.length, 7);
+	for (const r of ['"PANEL"', '"PANEL_2"', '"CHAIRMAN"', '"VALIDATOR"', '"COORDINATOR"', '"BUILDER"', '"ATTACKER"']) {
 		assert.ok(roles.includes(r), "Missing role " + r + " in COMMAND_CAST[gauntlet]");
 	}
 });
 
 test("1.14 validateManifest in source", () => {
-	assert.ok(src.includes('const validateManifest = (data: any)'), "validateManifest missing");
+	assert.ok(
+		src.includes('const validateManifest = (data: any)') || src.includes('function validateManifest(data: any)'),
+		"validateManifest missing",
+	);
 });
 
 test("1.15 topoLevels in source", () => {
-	assert.ok(src.includes('const topoLevels = (subtasks:'), "topoLevels missing");
+	assert.ok(
+		src.includes('const topoLevels = (subtasks:') || src.includes('function topoLevels(subtasks:'),
+		"topoLevels missing",
+	);
 });
 
 test("1.16 all 8 original commands still registered", () => {
@@ -578,7 +590,7 @@ test("6.06 gate fails → campaign halted", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 test("7.01 all 7 stage names have a case in runGauntletStage switch", () => {
-	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\n/m);
+	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
 	assert.ok(fnMatch, "Could not extract runGauntletStage function");
 	const body = fnMatch[0]!;
 	for (const name of ["DELIBERATE", "GATE-FIRST", "DECOMPOSE", "BUILD", "VERIFY", "HARDEN", "INTEGRATE"]) {
@@ -587,7 +599,7 @@ test("7.01 all 7 stage names have a case in runGauntletStage switch", () => {
 });
 
 test("7.02 DELIBERATE handles skipCouncil path", () => {
-	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\n/m);
+	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
 	assert.ok(fnMatch);
 	assert.ok(fnMatch[0]!.includes('state.skipCouncil'), "DELIBERATE missing skipCouncil check");
 });
@@ -597,49 +609,49 @@ test("7.03 DELIBERATE handles deliberateMode === 'debate' path", () => {
 });
 
 test("7.04 HARDEN handles skipRedteam path", () => {
-	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\n/m);
+	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
 	assert.ok(fnMatch);
 	const harden = fnMatch[0]!.slice(fnMatch[0]!.indexOf('case "HARDEN":'));
 	assert.ok(harden.includes('state.skipRedteam'), "HARDEN missing skipRedteam check");
 });
 
 test("7.05 GATE-FIRST calls validatorDesignGate", () => {
-	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\n/m);
+	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
 	assert.ok(fnMatch);
 	const section = fnMatch[0]!.slice(fnMatch[0]!.indexOf('case "GATE-FIRST":'), fnMatch[0]!.indexOf('case "DECOMPOSE":'));
 	assert.ok(section.includes('validatorDesignGate'), "GATE-FIRST missing validatorDesignGate");
 });
 
 test("7.06 DECOMPOSE calls coordinatorDecompose", () => {
-	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\n/m);
+	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
 	assert.ok(fnMatch);
 	const section = fnMatch[0]!.slice(fnMatch[0]!.indexOf('case "DECOMPOSE":'), fnMatch[0]!.indexOf('case "BUILD":'));
 	assert.ok(section.includes('coordinatorDecompose'), "DECOMPOSE missing coordinatorDecompose");
 });
 
 test("7.07 BUILD calls coordinatorWorkerLevels", () => {
-	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\n/m);
+	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
 	assert.ok(fnMatch);
 	const section = fnMatch[0]!.slice(fnMatch[0]!.indexOf('case "BUILD":'), fnMatch[0]!.indexOf('case "VERIFY":'));
 	assert.ok(section.includes('coordinatorWorkerLevels'), "BUILD missing coordinatorWorkerLevels");
 });
 
 test("7.08 VERIFY calls gateCorrectionLoop", () => {
-	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\n/m);
+	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
 	assert.ok(fnMatch);
 	const section = fnMatch[0]!.slice(fnMatch[0]!.indexOf('case "VERIFY":'), fnMatch[0]!.indexOf('case "HARDEN":'));
 	assert.ok(section.includes('gateCorrectionLoop'), "VERIFY missing gateCorrectionLoop");
 });
 
 test("7.09 HARDEN calls redteamSortieLoop", () => {
-	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\n/m);
+	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
 	assert.ok(fnMatch);
 	const section = fnMatch[0]!.slice(fnMatch[0]!.indexOf('case "HARDEN":'), fnMatch[0]!.indexOf('case "INTEGRATE":'));
 	assert.ok(section.includes('redteamSortieLoop'), "HARDEN missing redteamSortieLoop");
 });
 
 test("7.10 INTEGRATE calls coordinatorIntegrate", () => {
-	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\n/m);
+	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
 	assert.ok(fnMatch);
 	const section = fnMatch[0]!.slice(fnMatch[0]!.indexOf('case "INTEGRATE":'));
 	assert.ok(section.includes('coordinatorIntegrate'), "INTEGRATE missing coordinatorIntegrate");
@@ -799,7 +811,7 @@ test("9.08 source: if (!cont) break halts loop on failure", () => {
 });
 
 test("9.09 source: stage.endedAt is set even on failure (try/finally in runGauntletStage)", () => {
-	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\n/m);
+	const fnMatch = src.match(/async function runGauntletStage\([\s\S]*?^\t\}\r?\n/m);
 	assert.ok(fnMatch);
 	// The function has a try/catch that sets status=failed, then continues to set endedAt
 	assert.ok(fnMatch[0]!.includes('stage.endedAt'), "runGauntletStage must set stage.endedAt");
@@ -843,10 +855,22 @@ test("9.11 integrate failure — final stage fails, campaign halted", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 test("10.01 source widget uses stage status glyphs", () => {
-	assert.ok(src.includes('s.status === "done" ? "✓"'), "Widget missing done glyph ✓");
-	assert.ok(src.includes('s.status === "failed" ? "✗"'), "Widget missing failed glyph ✗");
-	assert.ok(src.includes('s.status === "skipped" ? "⊘"'), "Widget missing skipped glyph ⊘");
-	assert.ok(src.includes('s.status === "working" ? "◐"'), "Widget missing working glyph ◐");
+	assert.ok(
+		src.includes('s.status === "done" ? "✓"') || src.includes('status === "done" ? "✓"'),
+		"Widget missing done glyph ✓",
+	);
+	assert.ok(
+		src.includes('s.status === "failed" ? "✗"') || src.includes('status === "failed" ? "✗"'),
+		"Widget missing failed glyph ✗",
+	);
+	assert.ok(
+		src.includes('s.status === "skipped" ? "⊘"') || src.includes('status === "skipped" ? "⊘"'),
+		"Widget missing skipped glyph ⊘",
+	);
+	assert.ok(
+		src.includes('s.status === "working" ? "◐"') || src.includes('status === "working" ? "◐"'),
+		"Widget missing working glyph ◐",
+	);
 });
 
 test("10.02 widget renders campaignState.stages.map", () => {
@@ -1019,6 +1043,142 @@ test("14.03 scans from bottom", () => {
 
 test("14.04 no match → undefined", () => {
 	assert.strictEqual(parseStrictVerdictLine("no verdict", "VERDICT"), undefined);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. PANEL_2 / collectPanelModels (add-panel-2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type PanelSourceRole = "PANEL" | "PANEL_2";
+type PanelistEntry = { model: string; role: PanelSourceRole };
+type CastMember = { model: string; thinking?: string };
+type Cast = Record<string, CastMember | undefined>;
+
+const MULTI_PICK_ROLES_LOCAL: readonly string[] = ["PANEL", "PANEL_2"];
+const expandCastModelsLocal = (role: string, raw: string): string[] => {
+	const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+	if (MULTI_PICK_ROLES_LOCAL.includes(role)) return parts;
+	return parts.length ? [raw.trim()] : [];
+};
+const collectPanelModelsLocal = (
+	cast: Cast,
+	castModelFn: (role: string) => string,
+): PanelistEntry[] => {
+	const panelRaw = cast["PANEL"]?.model ?? castModelFn("ARCHITECT");
+	const panel2Raw = cast["PANEL_2"]?.model ?? "";
+	const fromPanel = expandCastModelsLocal("PANEL", panelRaw);
+	const fromPanel2 = expandCastModelsLocal("PANEL_2", panel2Raw);
+	const seen = new Set<string>();
+	const out: PanelistEntry[] = [];
+	for (const model of fromPanel) {
+		if (seen.has(model)) continue;
+		seen.add(model);
+		out.push({ model, role: "PANEL" });
+	}
+	for (const model of fromPanel2) {
+		if (seen.has(model)) continue;
+		seen.add(model);
+		out.push({ model, role: "PANEL_2" });
+	}
+	return out;
+};
+
+test("15.01 MULTI_PICK_ROLES is PANEL then PANEL_2 in source", () => {
+	const m = src.match(/const MULTI_PICK_ROLES:\s*readonly Role\[\]\s*=\s*\[([^\]]+)\]/);
+	assert.ok(m, "MULTI_PICK_ROLES not found");
+	const roles = m![1]!.split(",").map((s) => s.trim().replace(/["']/g, ""));
+	assert.deepStrictEqual(roles, ["PANEL", "PANEL_2"]);
+});
+
+test("15.02 KNOWN_ROLES includes PANEL_2 immediately after PANEL (length 12)", () => {
+	const m = src.match(/const KNOWN_ROLES:\s*readonly string\[\]\s*=\s*\[([\s\S]*?)\];/);
+	assert.ok(m, "KNOWN_ROLES not found");
+	const roles = m![1]!.split(",").map((s) => s.trim().replace(/["'\s]/g, "")).filter(Boolean);
+	assert.strictEqual(roles.length, 12);
+	const panelIdx = roles.indexOf("PANEL");
+	assert.ok(panelIdx >= 0, "PANEL missing");
+	assert.strictEqual(roles[panelIdx + 1], "PANEL_2");
+});
+
+test("15.03 COMMAND_CAST.council is PANEL, PANEL_2, CHAIRMAN", () => {
+	const m = src.match(/council:\s*\[([^\]]+)\]/);
+	assert.ok(m, "council cast not found");
+	const roles = m![1]!.split(",").map((s) => s.trim().replace(/["']/g, ""));
+	assert.deepStrictEqual(roles, ["PANEL", "PANEL_2", "CHAIRMAN"]);
+});
+
+test("15.04 ROLE_GLYPH / ROLE_SIDE / ROLE_COLOR for PANEL_2", () => {
+	assert.ok(/PANEL_2:\s*"architect"/.test(src) || /PANEL_2:\s*'architect'/.test(src), "ROLE_SIDE PANEL_2 not architect");
+	assert.ok(/PANEL_2:\s*"mdLink"/.test(src), "ROLE_COLOR PANEL_2 not mdLink");
+	assert.ok(/PANEL_2:\s*"☷"/.test(src), "ROLE_GLYPH PANEL_2 not ☷");
+});
+
+test("15.05 expandCastModels PANEL_2 CSV-splits", () => {
+	assert.deepStrictEqual(
+		expandCastModelsLocal("PANEL_2", "prov/a, prov/b,prov/c"),
+		["prov/a", "prov/b", "prov/c"],
+	);
+});
+
+test("15.06 collectPanelModels merge + dedupe (PANEL wins)", () => {
+	const cast: Cast = {
+		PANEL: { model: "a/x,b/y" },
+		PANEL_2: { model: "b/y,c/z" },
+	};
+	assert.deepStrictEqual(collectPanelModelsLocal(cast, () => "fallback/arch"), [
+		{ model: "a/x", role: "PANEL" },
+		{ model: "b/y", role: "PANEL" },
+		{ model: "c/z", role: "PANEL_2" },
+	]);
+});
+
+test("15.07 collectPanelModels empty PANEL_2 → PANEL only", () => {
+	const cast: Cast = { PANEL: { model: "a/x,b/y" } };
+	assert.deepStrictEqual(collectPanelModelsLocal(cast, () => "fallback/arch"), [
+		{ model: "a/x", role: "PANEL" },
+		{ model: "b/y", role: "PANEL" },
+	]);
+});
+
+test("15.08 collectPanelModels never calls castModel(PANEL_2); ARCHITECT fallback on PANEL only", () => {
+	const cast: Cast = {};
+	const asked: string[] = [];
+	const out = collectPanelModelsLocal(cast, (role) => {
+		asked.push(role);
+		return "prov/arch";
+	});
+	assert.ok(!asked.includes("PANEL_2"), "must not call castModel(PANEL_2)");
+	assert.deepStrictEqual(asked, ["ARCHITECT"]);
+	assert.deepStrictEqual(out, [{ model: "prov/arch", role: "PANEL" }]);
+	assert.ok(out.length < 2, "insufficient for spawn");
+});
+
+test("15.09 source defines collectPanelModels and never castModel(\"PANEL_2\") in helper", () => {
+	assert.ok(/function collectPanelModels\(/.test(src) || /const collectPanelModels\s*=/.test(src), "collectPanelModels missing");
+	const start = src.search(/collectPanelModels\s*[=(]/);
+	assert.ok(start > 0);
+	const slice = src.slice(start, start + 800);
+	assert.ok(!/castModel\(\s*["']PANEL_2["']\s*\)/.test(slice), "helper must not call castModel(PANEL_2)");
+	assert.ok(/cast\[["']PANEL_2["']\]\?\.model\s*\?\?\s*["']["']/.test(slice) || /cast\[["']PANEL_2["']\]\?\.model\s*\?\?\s*""/.test(slice),
+		"PANEL_2 raw must default to empty string");
+});
+
+test("15.10 /council min-panelist error mentions PANEL_2", () => {
+	assert.ok(/PANEL and\/or PANEL_2/.test(src), "council error copy must mention PANEL and/or PANEL_2");
+});
+
+test("15.11 stageRoles deliberate adds PANEL_2 in source", () => {
+	const start = src.indexOf("const stageRoles = ");
+	assert.ok(start > 0, "stageRoles not found");
+	const end = src.indexOf("return [...roles];", start);
+	const body = src.slice(start, end);
+	assert.ok(/roles\.add\(\s*["']PANEL_2["']\s*\)/.test(body), "stageRoles deliberate missing PANEL_2");
+});
+
+test("15.12 council + gauntlet deliberate call collectPanelModels", () => {
+	assert.ok(/collectPanelModels\(\s*cast\s*,\s*castModel\s*\)/.test(src), "collectPanelModels(cast, castModel) call sites missing");
+	const councilHits = [...src.matchAll(/collectPanelModels\(\s*cast\s*,\s*castModel\s*\)/g)];
+	assert.ok(councilHits.length >= 2, "expected /council and gauntlet deliberate both to call helper");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

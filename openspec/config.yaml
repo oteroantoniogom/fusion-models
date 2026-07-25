@@ -1,0 +1,103 @@
+schema: spec-driven
+strict_tdd: true
+
+context: |
+  Project: fusion-harness (repo root: fusion-models)
+  Purpose: Standalone Pi coding-agent extension that fuses frontier models
+  (AND, not OR) — ARCHITECT plans, BUILDER builds, optional FUSION / council /
+  gauntlet pipelines. Host session runs on the BUILDER model.
+
+  Primary surface:
+  - extensions/fusion-harness/fusion-harness.ts (single-extension TypeScript)
+  - extensions/fusion-harness/{SYSTEM,USER}_PROMPT_*.md (file-backed prompts)
+  - justfile recipes: just fh / fh-workhorse / fh-sota / fh-glm / fh-zen
+  - README.md documents commands, cast, flags, known failure modes
+
+  Stack:
+  - TypeScript (Pi extension API: @earendil-works/pi-coding-agent, pi-tui)
+  - Node.js child_process spawning `pi --mode json -p` clean-room children
+  - Astral uv PEP 723 gate scripts for /auto-validate
+  - No package.json at repo root; tests run via npx tsx
+  - Prereqs: pi, just, jq, uv; API keys in .env (never commit)
+
+  Tests:
+  - tests/*.ts — source-grounded structural + gauntlet integration suites
+  - Primary: npx tsx tests/test-gauntlet.ts
+  - Suites: test-suite-gauntlet-pipeline.ts, role-named architect/builder suites
+  - Some suites support PI_GAUNTLET_SKIP_RUNTIME=1 (fast) or PI_GAUNTLET_E2E=1
+
+  Conventions:
+  - Children: --no-skills --no-extensions --no-context-files
+  - Artifacts go to /tmp/fusion-harness-* (never into the repo)
+  - Two-column DX: ARCHITECT left, BUILDER right; hard role glyphs
+  - Cast: .fusion-harness.json + cast sheet UI; multi-provider roles
+  - Parallel writers share cwd — identity-in-filename required
+
+  Recent focus (context only; not a backlog commitment):
+  - Cast sheet multi-pick PANEL for /council
+  - Preflight CSV expansion
+  - Prompt @file offload for Windows ENAMETOOLONG
+  - Cast sheet ASCII layout fixes
+
+  Out of scope for product work during SDD phases unless a change says so:
+  - Do not commit secrets; do not write harness runtime artifacts into the tree
+
+rules:
+  proposal:
+    - Require a clear problem statement and non-goals
+    - Call out Windows path/CLI length and multi-provider cast risks when relevant
+  specs:
+    - Prefer Given/When/Then scenarios for slash-command and cast-sheet behavior
+    - Ground requirements in observable UI/CLI/artifact outcomes, not internals
+  design:
+    - List concrete files under extensions/fusion-harness/ and tests/
+    - Include at least one rejected alternative
+    - Note spawn/prompt/temp-file boundaries (ENAMETOOLONG, clean-room children)
+  tasks:
+    - Protect review workload (400-line budget forecast required)
+    - Sequence RED → GREEN → TRIANGULATE → REFACTOR when changing behavior
+    - Prefer focused npx tsx tests/<file>.ts over full E2E unless needed
+  apply:
+    test_command: "npx tsx tests/test-gauntlet.ts"
+  verify:
+    test_command: "npx tsx tests/test-gauntlet.ts"
+
+testing:
+  detected: "2026-07-25"
+  runner:
+    command: "npx tsx tests/test-gauntlet.ts"
+    framework: "node:assert + tsx"
+  layers:
+    unit: "npx tsx tests/test-gauntlet.ts"
+    integration: "npx tsx tests/test-suite-gauntlet-pipeline.ts"
+    e2e: "PI_GAUNTLET_E2E=1 npx tsx tests/gauntlet-works-ARCHITECT-zai-glm-5.2.ts"
+  commands:
+    unit:
+      - scope: "tests/test-gauntlet.ts"
+        command: "npx tsx tests/test-gauntlet.ts"
+        framework: "node:assert + tsx"
+      - scope: "tests/test-suite-gauntlet-pipeline.ts"
+        command: "npx tsx tests/test-suite-gauntlet-pipeline.ts"
+        framework: "node:assert + tsx"
+      - scope: "tests/test-suite-ARCHITECT-opencode-go-deepseek-v4-pro.ts"
+        command: "npx tsx tests/test-suite-ARCHITECT-opencode-go-deepseek-v4-pro.ts"
+        framework: "node:assert + tsx"
+    integration:
+      - scope: "tests/gauntlet-works-ARCHITECT-zai-glm-5.2.ts"
+        command: "PI_GAUNTLET_SKIP_RUNTIME=1 npx tsx tests/gauntlet-works-ARCHITECT-zai-glm-5.2.ts"
+        framework: "node:assert + tsx"
+    e2e:
+      - scope: "tests/gauntlet-works-ARCHITECT-zai-glm-5.2.ts"
+        command: "PI_GAUNTLET_E2E=1 npx tsx tests/gauntlet-works-ARCHITECT-zai-glm-5.2.ts"
+        framework: "node:assert + tsx"
+  coverage:
+    command: ""
+    commands: []
+
+quality:
+  lint: ""
+  lint_commands: []
+  typecheck: ""
+  typecheck_commands: []
+  format: ""
+  format_commands: []

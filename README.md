@@ -39,9 +39,9 @@ pi -e extensions/fusion-harness/fusion-harness.ts \
 | `/auto-validate <prompt>` | 2 + gate | VALIDATOR designs a gate first, BUILDER builds, gate runs, failures loop until green or halt. |
 | `/debate <prompt> [--rounds N] [--reveal]` | 2–3 | Multi-round dialectic. Anonymized judge renders verdict on an anonymized transcript. Early-stop convergence check. |
 | `/coordinate <prompt> [--no-fix-up]` | 1+ | Manifest-driven orchestration: COORDINATOR decomposes → workers execute by dependency level → COORDINATOR verifies + one fix-up pass. |
-| `/council <prompt>` | K+1+ | Panel of K models answers independently, anonymized Borda-count ranking, CHAIRMAN synthesizes. |
+| `/council <prompt>` | K+1+ | Merged panel from `PANEL` ∪ `PANEL_2` (multi-pick, deduped; ≥2 total) answers independently, anonymized Borda ranking, CHAIRMAN synthesizes. Empty `PANEL_2` contributes nothing (no ARCHITECT fallback). |
 | `/redteam <prompt> [--rounds N]` | 2 | Adversarial build/attack loop: BUILDER builds, ATTACKER probes, BREACH feeds back for patches, CONCEDE ends green. |
-| `/gauntlet <prompt> [--skip-council] [--skip-redteam]` | 10+ | Full pipeline: council → gate design → decompose → build → verify → harden → integrate. The composite command. |
+| `/gauntlet <prompt> [--skip-council] [--skip-redteam] [--deliberate=council|debate] [--resume [dir]]` | 10+ | Full pipeline: council → gate design → decompose → build → verify → harden → integrate. The composite command. |
 | `/chain <stages> <prompt>` | varies | Run ordered stage subsets: `deliberate,gate,build,verify` etc. Prerequisite validation before any spawn. |
 
 ### Supporting commands
@@ -73,7 +73,7 @@ The host runs on the BUILDER model. Plain messages = native Pi. Slash commands f
 
 ### Two columns, everywhere
 
-ARCHITECT left, BUILDER right. Live streaming widget, final panels in scrollback, aligned footer with role/model/thinking/context-bar. Hard role glyphs: ◆ ARCHITECT, ▲ BUILDER, ⧉ FUSION, ✓ VALIDATOR, ◈ DEBATER_A, ◇ DEBATER_B, ⚖ JUDGE, ◎ COORDINATOR, ⊞ PANEL, ♛ CHAIRMAN, ⚡ ATTACKER.
+ARCHITECT left, BUILDER right. Live streaming widget, final panels in scrollback, aligned footer with role/model/thinking/context-bar. Hard role glyphs: ◆ ARCHITECT, ▲ BUILDER, ⧉ FUSION, ✓ VALIDATOR, ◈ DEBATER_A, ◇ DEBATER_B, ⚖ JUDGE, ◎ COORDINATOR, ☰ PANEL, ☷ PANEL_2, ★ CHAIRMAN, ✕ ATTACKER.
 
 ### Clean-room children
 
@@ -84,6 +84,8 @@ Every spawn: `--no-skills --no-extensions --no-context-files`. Children never lo
 ## Multi-provider casting
 
 Every role can hold any model from any registered provider. The cast sheet opens on invocation — type to filter, `t` to cycle thinking, `Esc` to cancel with zero side effects.
+
+`PANEL` and `PANEL_2` are multi-pick rows (comma-separated models). `/council` and gauntlet council deliberate merge them into one panelist pool: all `PANEL` models first, then new `PANEL_2` models, deduped by exact `provider/id` (first wins). Unset `PANEL` falls back to `ARCHITECT`; empty `PANEL_2` contributes zero models. Need ≥2 unique panelists after merge.
 
 ### Provider table
 

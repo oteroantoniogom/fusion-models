@@ -1,7 +1,7 @@
 # --- Local / session config ---
 .pi/
 .fusion-harness.json
-openspec/
+# openspec/ is versioned (config, specs, changes) — do not ignore
 
 # --- Secrets / env ---
 # .env holds real API keys (ANTHROPIC, SERPAPI, DATAFORSEO, GITHUB_TOKEN, etc.)
