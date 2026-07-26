@@ -1,40 +1,40 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 492" width="760" height="492" role="img" aria-label="Gauntlet campaign summary — DELIBERATE: PASS, GATE-FIRST: PASS, DECOMPOSE: PASS, BUILD: PASS, VERIFY: PASS, HARDEN: PASS, INTEGRATE: PASS" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
-<rect x="0" y="0" width="760" height="492" rx="14" fill="#0d1117"/>
-<rect x="0.75" y="0.75" width="758.5" height="490.5" rx="13.5" fill="none" stroke="#30363d" stroke-width="1.5"/>
-<text x="380" y="46" text-anchor="middle" fill="#e6edf3" font-size="20" font-weight="700" letter-spacing="2">GAUNTLET CAMPAIGN</text>
-<text x="380" y="72" text-anchor="middle" fill="#8b949e" font-size="12">Build a CLI task runner with subcommands and config · 286.1s · ~$0.1779</text>
-<rect x="28" y="98" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
-<text x="42" y="117" fill="#3fb950" font-size="15" font-weight="700">✓</text>
-<text x="68" y="117" fill="#e6edf3" font-size="14" font-weight="600">1. DELIBERATE</text>
-<text x="561.6" y="117" text-anchor="start" fill="#3fb950" font-size="12">PASS · 18.4s · $0.0123</text>
-<rect x="28" y="128" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
-<text x="42" y="147" fill="#3fb950" font-size="15" font-weight="700">✓</text>
-<text x="68" y="147" fill="#e6edf3" font-size="14" font-weight="600">2. GATE-FIRST</text>
-<text x="568.8" y="147" text-anchor="start" fill="#3fb950" font-size="12">PASS · 9.1s · $0.0044</text>
-<rect x="28" y="158" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
-<text x="42" y="177" fill="#3fb950" font-size="15" font-weight="700">✓</text>
-<text x="68" y="177" fill="#e6edf3" font-size="14" font-weight="600">3. DECOMPOSE</text>
-<text x="568.8" y="177" text-anchor="start" fill="#3fb950" font-size="12">PASS · 7.7s · $0.0050</text>
-<rect x="28" y="188" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
-<text x="42" y="207" fill="#3fb950" font-size="15" font-weight="700">✓</text>
-<text x="68" y="207" fill="#e6edf3" font-size="14" font-weight="600">4. BUILD</text>
-<text x="554.4" y="207" text-anchor="start" fill="#3fb950" font-size="12">PASS · 142.9s · $0.0881</text>
-<rect x="28" y="218" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
-<text x="42" y="237" fill="#3fb950" font-size="15" font-weight="700">✓</text>
-<text x="68" y="237" fill="#e6edf3" font-size="14" font-weight="600">5. VERIFY</text>
-<text x="561.6" y="237" text-anchor="start" fill="#3fb950" font-size="12">PASS · 31.2s · $0.0198</text>
-<rect x="28" y="248" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
-<text x="42" y="267" fill="#3fb950" font-size="15" font-weight="700">✓</text>
-<text x="68" y="267" fill="#e6edf3" font-size="14" font-weight="600">6. HARDEN</text>
-<text x="561.6" y="267" text-anchor="start" fill="#3fb950" font-size="12">PASS · 64.5s · $0.0412</text>
-<rect x="28" y="278" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
-<text x="42" y="297" fill="#3fb950" font-size="15" font-weight="700">✓</text>
-<text x="68" y="297" fill="#e6edf3" font-size="14" font-weight="600">7. INTEGRATE</text>
-<text x="561.6" y="297" text-anchor="start" fill="#3fb950" font-size="12">PASS · 12.3s · $0.0071</text>
-<text x="28" y="334" fill="#8b949e" font-size="12" font-weight="600">SUBTASKS</text>
-<text x="36" y="354" fill="#3fb950" font-size="13">✓ scaffold CLI entry + arg parsing</text>
-<text x="36" y="376" fill="#3fb950" font-size="13">✓ implement core command dispatcher</text>
-<text x="36" y="398" fill="#3fb950" font-size="13">✓ add config layer + persistence</text>
-<text x="36" y="420" fill="#3fb950" font-size="13">✓ write integration tests</text>
-<text x="380" y="480" text-anchor="middle" fill="#484f58" font-size="10">fusion-harness · gauntlet campaign</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 492" width="760" height="492" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" role="img" aria-label="Gauntlet campaign summary — DELIBERATE through INTEGRATE all PASS with timings and cost">
+  <rect x="0" y="0" width="760" height="492" rx="14" fill="#0d1117"/>
+  <rect x="0.75" y="0.75" width="758.5" height="490.5" rx="13.5" fill="none" stroke="#30363d" stroke-width="1.5"/>
+  <text x="380" y="46" text-anchor="middle" fill="#e6edf3" font-size="20" font-weight="700">GAUNTLET CAMPAIGN</text>
+  <text x="380" y="72" text-anchor="middle" fill="#8b949e" font-size="12">Build a CLI task runner with subcommands and config · 286.1s · ~$0.1779</text>
+  <rect x="28" y="98" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
+  <text x="42" y="114" fill="#3fb950" font-size="15" font-weight="700">&#10003;</text>
+  <text x="68" y="114" fill="#e6edf3" font-size="14" font-weight="600">1. DELIBERATE</text>
+  <text x="720" y="114" text-anchor="end" fill="#3fb950" font-size="12">PASS · 18.4s · $0.0123</text>
+  <rect x="28" y="128" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
+  <text x="42" y="144" fill="#3fb950" font-size="15" font-weight="700">&#10003;</text>
+  <text x="68" y="144" fill="#e6edf3" font-size="14" font-weight="600">2. GATE-FIRST</text>
+  <text x="720" y="144" text-anchor="end" fill="#3fb950" font-size="12">PASS · 9.1s · $0.0044</text>
+  <rect x="28" y="158" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
+  <text x="42" y="174" fill="#3fb950" font-size="15" font-weight="700">&#10003;</text>
+  <text x="68" y="174" fill="#e6edf3" font-size="14" font-weight="600">3. DECOMPOSE</text>
+  <text x="720" y="174" text-anchor="end" fill="#3fb950" font-size="12">PASS · 7.7s · $0.0050</text>
+  <rect x="28" y="188" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
+  <text x="42" y="204" fill="#3fb950" font-size="15" font-weight="700">&#10003;</text>
+  <text x="68" y="204" fill="#e6edf3" font-size="14" font-weight="600">4. BUILD</text>
+  <text x="720" y="204" text-anchor="end" fill="#3fb950" font-size="12">PASS · 142.9s · $0.0881</text>
+  <rect x="28" y="218" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
+  <text x="42" y="234" fill="#3fb950" font-size="15" font-weight="700">&#10003;</text>
+  <text x="68" y="234" fill="#e6edf3" font-size="14" font-weight="600">5. VERIFY</text>
+  <text x="720" y="234" text-anchor="end" fill="#3fb950" font-size="12">PASS · 31.2s · $0.0198</text>
+  <rect x="28" y="248" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
+  <text x="42" y="264" fill="#3fb950" font-size="15" font-weight="700">&#10003;</text>
+  <text x="68" y="264" fill="#e6edf3" font-size="14" font-weight="600">6. HARDEN</text>
+  <text x="720" y="264" text-anchor="end" fill="#3fb950" font-size="12">PASS · 64.5s · $0.0412</text>
+  <rect x="28" y="278" width="704" height="24" rx="7" fill="#161b22" stroke="#3fb950" stroke-width="1.25"/>
+  <text x="42" y="294" fill="#3fb950" font-size="15" font-weight="700">&#10003;</text>
+  <text x="68" y="294" fill="#e6edf3" font-size="14" font-weight="600">7. INTEGRATE</text>
+  <text x="720" y="294" text-anchor="end" fill="#3fb950" font-size="12">PASS · 12.3s · $0.0071</text>
+  <text x="28" y="334" fill="#8b949e" font-size="12" font-weight="600">SUBTASKS</text>
+  <text x="36" y="354" fill="#3fb950" font-size="13">&#10003; scaffold CLI entry + arg parsing</text>
+  <text x="36" y="376" fill="#3fb950" font-size="13">&#10003; implement core command dispatcher</text>
+  <text x="36" y="398" fill="#3fb950" font-size="13">&#10003; add config layer + persistence</text>
+  <text x="36" y="420" fill="#3fb950" font-size="13">&#10003; write integration tests</text>
+  <text x="380" y="480" text-anchor="middle" fill="#484f58" font-size="11">fusion-harness · gauntlet campaign</text>
 </svg>

@@ -1,8 +1,26 @@
 # fusion-harness
 
-> Fuse frontier models instead of racing them. AND, not OR.
+> **Fuse frontier models instead of racing them. AND, not OR.**
+>
+> A standalone [Pi coding agent](https://github.com/badlogic/pi-mono) extension for multi-model agentic engineering.
 
-A standalone [Pi coding agent](https://github.com/badlogic/pi-mono) extension for two-model agentic engineering. One model plans, another builds, and the results fuse — you combine compute instead of selecting it.
+Fork of [disler/fusion-harness](https://github.com/disler/fusion-harness) — same fusion thesis, extended into a full coordination suite and campaign pipeline.
+
+<p align="center">
+  <img src="images/hero.png" alt="MODEL FUSION — two model energy streams fusing into one over an engineer's keyboard" width="850">
+</p>
+
+<p align="center">
+  <img src="images/svg-01-fusion-hero-animated.svg" alt="ARCHITECT and BUILDER streams fusing into one result — AND, not OR" width="850">
+</p>
+
+"Which model is best" is a benchmark question, not an engineering question. One model plans, another builds, and the results fuse: you combine compute instead of selecting it. Aider called the pattern [architect/editor](https://aider.chat/2024/09/26/architect.html); [Devin calls it fusion](https://cognition.com/blog/devin-fusion); [OpenRouter calls it model fusion](https://openrouter.ai/blog/announcements/fusion-beats-frontier/). **You don't have to pick a winner when you can hire both.**
+
+This fork keeps the original three commands and ships what upstream only sketched: cast any provider into any role, five coordination modes, a council with `PANEL` ∪ `PANEL_2`, and `/gauntlet` — a full campaign pipeline you can also slice with `/chain`.
+
+<p align="center">
+  <img src="images/svg-11-value-ladder.svg" alt="Value ladder: foundation trio → coordination suite → gauntlet factory" width="850">
+</p>
 
 ---
 
@@ -29,39 +47,31 @@ pi -e extensions/fusion-harness/fusion-harness.ts \
 
 ---
 
-## Commands
+## 1 · Foundation (upstream core)
+
+<p align="center">
+  <img src="images/svg-03-three-commands.svg" alt="/opinion — side by side, /fusion — merged via a fusion agent, /auto-validate — validator gate + builder loop" width="780">
+</p>
 
 | Command | Agents | What happens |
 |---|---|---|
 | `/opinion <prompt>` | 2 | Both models answer independently (read-only). Side-by-side panel: latency, tokens, cost, full answers. |
-| `/parallel <prompt>` | 2 | ARCHITECT and BUILDER execute the same task with full tools in parallel — a build-off. |
-| `/fusion "<prompt>" "<fusion-prompt>"` | 3 | ARCHITECT + BUILDER answer in parallel (full tools), then a FUSION agent merges both per your instruction with `[ARCHITECT]`/`[BUILDER]` attribution. |
+| `/fusion "<prompt>" "<fusion-prompt>"` | 3 | ARCHITECT + BUILDER answer in parallel (full tools), then a FUSION agent merges both with `[ARCHITECT]`/`[BUILDER]` attribution. |
 | `/auto-validate <prompt>` | 2 + gate | VALIDATOR designs a gate first, BUILDER builds, gate runs, failures loop until green or halt. |
-| `/debate <prompt> [--rounds N] [--reveal]` | 2–3 | Multi-round dialectic. Anonymized judge renders verdict on an anonymized transcript. Early-stop convergence check. |
-| `/coordinate <prompt> [--no-fix-up]` | 1+ | Manifest-driven orchestration: COORDINATOR decomposes → workers execute by dependency level → COORDINATOR verifies + one fix-up pass. |
-| `/council <prompt>` | K+1+ | Merged panel from `PANEL` ∪ `PANEL_2` (multi-pick, deduped; ≥2 total) answers independently, anonymized Borda ranking, CHAIRMAN synthesizes. Empty `PANEL_2` contributes nothing (no ARCHITECT fallback). |
-| `/redteam <prompt> [--rounds N]` | 2 | Adversarial build/attack loop: BUILDER builds, ATTACKER probes, BREACH feeds back for patches, CONCEDE ends green. |
-| `/gauntlet <prompt> [--skip-council] [--skip-redteam] [--deliberate=council|debate] [--resume [dir]]` | 10+ | Full pipeline: council → gate design → decompose → build → verify → harden → integrate. The composite command. |
-| `/chain <stages> <prompt>` | varies | Run ordered stage subsets: `deliberate,gate,build,verify` etc. Prerequisite validation before any spawn. |
-
-### Supporting commands
-
-| Command | What |
-|---|---|
-| `/thinking <level> [builder-level]` | Retune thinking mid-session — no restart. |
-| `/fh-reset` | Wipe persistent per-project role sessions. |
-| `/system-prompt` | Show ARCHITECT and BUILDER system prompts side by side (zero cost). |
-| `/roles` | Open cast sheet over all roles outside any command. |
-
----
-
-## Architecture
 
 ### Raw chat IS the builder
+
+<p align="center">
+  <img src="images/svg-04-host-as-builder.svg" alt="Host session is the builder; slash commands fork it; architect stays a separate persistent brain" width="780">
+</p>
 
 The host runs on the BUILDER model. Plain messages = native Pi. Slash commands fork the builder child, inheriting your raw chats. The ARCHITECT stays a separate persistent brain (per project + per model in `/tmp/fusion-harness-sessions/`).
 
 ### The auto-validation loop
+
+<p align="center">
+  <img src="images/svg-05-gate-first-loop-animated.svg" alt="Gate-first auto-validation loop: design gate, build, run, fail feeds back, escalate, halt" width="780">
+</p>
 
 1. VALIDATOR designs `gate.py` first (Astral `uv` PEP 723 script)
 2. Baseline must fail RED
@@ -73,7 +83,13 @@ The host runs on the BUILDER model. Plain messages = native Pi. Slash commands f
 
 ### Two columns, everywhere
 
-ARCHITECT left, BUILDER right. Live streaming widget, final panels in scrollback, aligned footer with role/model/thinking/context-bar. Hard role glyphs: ◆ ARCHITECT, ▲ BUILDER, ⧉ FUSION, ✓ VALIDATOR, ◈ DEBATER_A, ◇ DEBATER_B, ⚖ JUDGE, ◎ COORDINATOR, ☰ PANEL, ☷ PANEL_2, ★ CHAIRMAN, ✕ ATTACKER.
+<p align="center">
+  <img src="images/svg-06-two-column-dx.svg" alt="Two-column terminal DX with architect left, builder right, fusion row, aligned footer" width="780">
+</p>
+
+ARCHITECT left, BUILDER right. Live streaming widget, final panels in scrollback, aligned footer with role/model/thinking/context-bar.
+
+Hard role glyphs: ◆ ARCHITECT, ▲ BUILDER, ⧉ FUSION, ✓ VALIDATOR, ◈ DEBATER_A, ◇ DEBATER_B, ⚖ JUDGE, ◎ COORDINATOR, ☰ PANEL, ☷ PANEL_2, ★ CHAIRMAN, ✕ ATTACKER.
 
 ### Clean-room children
 
@@ -81,11 +97,41 @@ Every spawn: `--no-skills --no-extensions --no-context-files`. Children never lo
 
 ---
 
-## Multi-provider casting
+## 2 · Coordination suite (this fork)
+
+Upstream README said you *could* build `/debate`, `/parallel`, `/coordinate`. This fork ships those plus `/council` and `/redteam`.
+
+<p align="center">
+  <img src="images/svg-08-coordination-suite.svg" alt="Five coordination modes: parallel, debate, coordinate, council, redteam" width="850">
+</p>
+
+| Command | Agents | What happens |
+|---|---|---|
+| `/parallel <prompt>` | 2 | ARCHITECT and BUILDER execute the same task with full tools in parallel — a build-off. |
+| `/debate <prompt> [--rounds N] [--reveal]` | 2–3 | Multi-round dialectic. Anonymized judge renders verdict on an anonymized transcript. Early-stop convergence check. |
+| `/coordinate <prompt> [--no-fix-up]` | 1+ | Manifest-driven orchestration: COORDINATOR decomposes → workers execute by dependency level → COORDINATOR verifies + one fix-up pass. |
+| `/council <prompt>` | K+1+ | Merged panel from `PANEL` ∪ `PANEL_2` answers independently, anonymized Borda ranking, CHAIRMAN synthesizes. |
+| `/redteam <prompt> [--rounds N]` | 2 | Adversarial build/attack loop: BUILDER builds, ATTACKER probes, BREACH feeds back for patches, CONCEDE ends green. |
+
+### Multi-provider cast
+
+<p align="center">
+  <img src="images/svg-09-multi-provider-cast.svg" alt="Cast sheet with any provider per role, PANEL multi-pick, providers list" width="840">
+</p>
 
 Every role can hold any model from any registered provider. The cast sheet opens on invocation — type to filter, `t` to cycle thinking, `Esc` to cancel with zero side effects.
 
-`PANEL` and `PANEL_2` are multi-pick rows (comma-separated models). `/council` and gauntlet council deliberate merge them into one panelist pool: all `PANEL` models first, then new `PANEL_2` models, deduped by exact `provider/id` (first wins). Unset `PANEL` falls back to `ARCHITECT`; empty `PANEL_2` contributes zero models. Need ≥2 unique panelists after merge.
+Supporting commands: `/roles` (cast sheet anytime), `/thinking <level> [builder-level]`, `/fh-reset`, `/system-prompt`.
+
+Project cast file: `<cwd>/.fusion-harness.json` — roles → `{ model, thinking? }`. Boot order: built-in defaults → project file → flags → session mutations.
+
+### Council: PANEL ∪ PANEL_2
+
+<p align="center">
+  <img src="images/svg-10-council-panel.svg" alt="Council pool merge of PANEL and PANEL_2 with dedupe then Borda and CHAIRMAN" width="840">
+</p>
+
+`PANEL` and `PANEL_2` are multi-pick rows (comma-separated models). `/council` and gauntlet deliberate merge them into one panelist pool: all `PANEL` models first, then new `PANEL_2` models, deduped by exact `provider/id` (first wins). Unset `PANEL` falls back to `ARCHITECT`; empty `PANEL_2` contributes zero models. Need ≥2 unique panelists after merge.
 
 ### Provider table
 
@@ -102,11 +148,38 @@ Every role can hold any model from any registered provider. The cast sheet opens
 | `mistral` | `MISTRAL_API_KEY` | `/login mistral` |
 | *(any)* | `{PROVIDER}_API_KEY` | `/login {provider}` |
 
-### Project cast file
+---
 
-`<cwd>/.fusion-harness.json` — roles → `{ model, thinking? }`. Boot order: built-in defaults → project file → flags → session mutations.
+## 3 · Factory pipeline (this fork)
 
-### Recipes
+<p align="center">
+  <img src="images/svg-12-gauntlet-pipeline.svg" alt="Gauntlet seven-stage pipeline and /chain composer" width="850">
+</p>
+
+<p align="center">
+  <img src="images/svg-07-gauntlet-campaign.svg" alt="Gauntlet campaign summary with seven PASS stages" width="760">
+</p>
+
+| Command | Agents | What happens |
+|---|---|---|
+| `/gauntlet <prompt> [--skip-council] [--skip-redteam] [--deliberate=council\|debate] [--resume [dir]]` | 10+ | Full pipeline: deliberate → gate → decompose → build → verify → harden → integrate. |
+| `/chain <stages> <prompt>` | varies | Run ordered stage subsets: `deliberate,gate,build,verify` etc. Prerequisite validation before any spawn. |
+
+Stages compose the coordination modes you already have — council/debate for deliberate, auto-validate-style gates, coordinate-style decompose/build, redteam for harden. `/chain` is the same machinery without forcing the full campaign.
+
+---
+
+## Diagram MCP
+
+Generate or regenerate the fork README SVGs with [`fusion-svg-mcp`](https://github.com/oteroantoniogom/fusion-svg-mcp) (also vendored at `tools/fusion-svg-mcp`):
+
+```bash
+cd tools/fusion-svg-mcp && npm install && npm run generate
+```
+
+---
+
+## Recipes
 
 ```
 just fh                 # default: opencode-go deepseek-v4-pro + deepseek-v4-flash (max thinking)
@@ -167,11 +240,11 @@ Every run writes to `/tmp/fusion-harness-XXXXXX/` — `prompt.md`, role answers,
 ```
 fusion-harness/
 ├── extensions/fusion-harness/
-│   ├── fusion-harness.ts        # the whole harness — 8 commands, widget, footer, renderer
+│   ├── fusion-harness.ts        # the whole harness — commands, widget, footer, renderer
 │   ├── SYSTEM_PROMPT_*.md       # validator + triage contracts
 │   └── USER_PROMPT_*.md         # every default prompt, {{VAR}} interpolated
 ├── tests/                       # gauntlet + integration tests
-├── images/                      # README visuals
+├── images/                      # README visuals (Disler SVGs + fork diagrams)
 ├── justfile                     # task runner
 ├── .env                         # API keys (never commit)
 └── LICENSE                      # MIT
@@ -187,6 +260,12 @@ fusion-harness/
 - **Parallel writers share cwd**: identity-in-filename required (`-ARCHITECT-<model>`)
 - **Stale role memories**: `/fh-reset` gives both roles a clean brain
 - **Headless hosts**: `--no-session` falls back to manifest-pinned persistent session
+
+---
+
+## Upstream
+
+Built on [disler/fusion-harness](https://github.com/disler/fusion-harness) by [IndyDevDan](https://github.com/disler). Original video walkthrough: [GPT-5.6 Sol vs Fable 5 Is the Wrong Question (Fusion)](https://youtu.be/AQl5Q-0l7FQ).
 
 ---
 

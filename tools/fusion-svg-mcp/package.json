@@ -1,0 +1,52 @@
+{
+  "name": "fusion-svg-mcp",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "description": "MCP server that generates Disler-style fusion-harness README SVGs (palette, cards, flow animations).",
+  "license": "MIT",
+  "author": "oteroantoniogom",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oteroantoniogom/fusion-svg-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/oteroantoniogom/fusion-svg-mcp/issues"
+  },
+  "homepage": "https://github.com/oteroantoniogom/fusion-svg-mcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "svg",
+    "fusion-harness",
+    "cursor",
+    "diagram"
+  ],
+  "bin": {
+    "fusion-svg-generate": "./src/generate.ts",
+    "fusion-svg-mcp": "./src/server.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "preview.html"
+  ],
+  "scripts": {
+    "generate": "tsx src/generate.ts",
+    "mcp": "tsx src/server.ts",
+    "start": "tsx src/server.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  }
+}
