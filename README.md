@@ -7,11 +7,7 @@
 Fork of [disler/fusion-harness](https://github.com/disler/fusion-harness) — same fusion thesis, extended into a full coordination suite and campaign pipeline.
 
 <p align="center">
-  <img src="images/hero.png" alt="MODEL FUSION — two model energy streams fusing into one over an engineer's keyboard" width="850">
-</p>
-
-<p align="center">
-  <img src="images/svg-01-fusion-hero-animated.svg" alt="ARCHITECT and BUILDER streams fusing into one result — AND, not OR" width="850">
+  <img src="images/hero-next.result.svg" alt="MODEL FUSION - blue and amber energy streams colliding above a keyboard - AND, not OR" width="850">
 </p>
 
 "Which model is best" is a benchmark question, not an engineering question. One model plans, another builds, and the results fuse: you combine compute instead of selecting it. Aider called the pattern [architect/editor](https://aider.chat/2024/09/26/architect.html); [Devin calls it fusion](https://cognition.com/blog/devin-fusion); [OpenRouter calls it model fusion](https://openrouter.ai/blog/announcements/fusion-beats-frontier/). **You don't have to pick a winner when you can hire both.**
