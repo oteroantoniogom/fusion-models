@@ -59,6 +59,28 @@ npm run generate -- --out ./out
 
 Open `preview.html` to compare against upstream `svg-03`.
 
+## Examples (prompt → result)
+
+| Prompt | Result SVG |
+|---|---|
+| [`examples/gauntlet-pipeline.prompt.md`](./examples/gauntlet-pipeline.prompt.md) | [`examples/gauntlet-pipeline.result.svg`](./examples/gauntlet-pipeline.result.svg) |
+| [`examples/coordination-suite.prompt.md`](./examples/coordination-suite.prompt.md) | [`examples/coordination-suite.result.svg`](./examples/coordination-suite.result.svg) |
+| [`examples/council-panel.prompt.md`](./examples/council-panel.prompt.md) | [`examples/council-panel.result.svg`](./examples/council-panel.result.svg) |
+
+Flow diagram: [`examples/prompt-to-result.result.svg`](./examples/prompt-to-result.result.svg)
+
+```bash
+npm run examples
+```
+
+<p align="center">
+  <img src="examples/prompt-to-result.result.svg" alt="MCP prompt in, SVG result out" width="760">
+</p>
+
+<p align="center">
+  <img src="examples/gauntlet-pipeline.result.svg" alt="Example gauntlet-pipeline result" width="850">
+</p>
+
 ## Style grammar (from Disler originals)
 
 | Token | Rule |

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 280" width="760" height="280" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" role="img" aria-label="Example flow: MCP generate_diagram prompt in, SVG result out — local, no API keys">
+  <rect x="0" y="0" width="760" height="280" rx="14" fill="#0d1117"/>
+  <rect x="0.75" y="0.75" width="758.5" height="278.5" rx="13.5" fill="none" stroke="#30363d" stroke-width="1.5"/>
+  <text x="380" y="40" text-anchor="middle" fill="#e6edf3" font-size="16" font-weight="700" letter-spacing="2">EXAMPLE FLOW</text>
+  <text x="380" y="62" text-anchor="middle" fill="#8b949e" font-size="12">prompt in · SVG out · no API keys required</text>
+  <rect x="40" y="90" width="300" height="120" rx="10" fill="#161b22" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="190" y="125" text-anchor="middle" fill="#a78bfa" font-size="13" font-weight="700">PROMPT</text>
+  <text x="190" y="150" text-anchor="middle" fill="#e6edf3" font-size="12">generate_diagram</text>
+  <text x="190" y="172" text-anchor="middle" fill="#8b949e" font-size="11">{ id: &quot;gauntlet-pipeline&quot; }</text>
+  <text x="190" y="194" text-anchor="middle" fill="#484f58" font-size="10">local MCP / CLI</text>
+  <text x="380" y="150" text-anchor="middle" fill="#484f58" font-size="22">&#8594;</text>
+  <rect x="420" y="90" width="300" height="120" rx="10" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="570" y="125" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="700">RESULT</text>
+  <text x="570" y="150" text-anchor="middle" fill="#e6edf3" font-size="12">*.result.svg</text>
+  <text x="570" y="172" text-anchor="middle" fill="#8b949e" font-size="11">Disler-style markup</text>
+  <text x="570" y="194" text-anchor="middle" fill="#484f58" font-size="10">deterministic · offline</text>
+  <text x="380" y="256" text-anchor="middle" fill="#484f58" font-size="11">see examples/*.prompt.md + examples/*.result.svg</text>
+</svg>

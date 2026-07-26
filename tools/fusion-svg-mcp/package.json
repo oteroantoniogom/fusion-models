@@ -28,12 +28,14 @@
   },
   "files": [
     "src",
+    "examples",
     "README.md",
     "LICENSE",
     "preview.html"
   ],
   "scripts": {
     "generate": "tsx src/generate.ts",
+    "examples": "tsx src/examples.ts",
     "mcp": "tsx src/server.ts",
     "start": "tsx src/server.ts"
   },
